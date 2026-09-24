@@ -28,6 +28,15 @@ def same_bits(a, b):
             and torch.equal(a.contiguous().reshape(-1).view(torch.uint8), b.contiguous().reshape(-1).view(torch.uint8)))
 
 
+def weights(shape, dtype):
+    """Random weights as they look in a model file of that dtype: small floats, fp8 scaled to its range, or int8
+    spread over most of its range the way per-channel int8 quantization leaves them."""
+    values = torch.randn(shape)
+    if dtype == torch.int8:
+        return (values * 30).round().clamp(-127, 127).to(torch.int8)
+    return (values * (50 if dtype == torch.float8_e4m3fn else 0.02)).to(dtype)
+
+
 def every_bit_pattern(dtype):
     view = codec.FORMATS[dtype][0]
     if view == torch.uint8:
@@ -45,18 +54,18 @@ def test_every_bit_pattern_round_trips(dtype, chunk, monkeypatch):
     monkeypatch.setattr(codec, "CHUNK", chunk)
     torch.manual_seed(0)
     patterns = every_bit_pattern(dtype)
-    weights = (torch.randn(10 * patterns.numel() + 5) * 0.02).to(dtype)
-    tensor = torch.cat([weights, patterns])[torch.randperm(weights.numel() + patterns.numel())].view(-1, 1)
+    ordinary = weights(10 * patterns.numel() + 5, dtype)
+    tensor = torch.cat([ordinary, patterns])[torch.randperm(ordinary.numel() + patterns.numel())].view(-1, 1)
 
     blob, info = codec.encode(tensor)
     assert same_bits(codec.decode(blob, info), tensor)
 
 
 @pytest.mark.parametrize("dtype, saving", [(torch.bfloat16, 0.25), (torch.float32, 0.12), (torch.float16, 0.08),
-                                           (torch.float8_e4m3fn, 0.15), (torch.float8_e5m2, 0.15)], ids=str)
+                                           (torch.float8_e4m3fn, 0.15), (torch.float8_e5m2, 0.15), (torch.int8, 0.06)], ids=str)
 def test_weights_get_smaller(dtype, saving):
     torch.manual_seed(0)
-    tensor = (torch.randn(512, 1024) * 0.02).to(dtype)
+    tensor = weights((512, 1024), dtype) if dtype == torch.int8 else (torch.randn(512, 1024) * 0.02).to(dtype)
     blob, _ = codec.encode(tensor)
     assert blob.numel() < tensor.nbytes * (1 - saving)
 
@@ -97,6 +106,47 @@ def test_compressed_file_restores_the_exact_original(model_file, tmp_path):
     restored = str(tmp_path / "restored.safetensors")
     fileformat.decompress_file(compressed, restored)
     assert all(same_bits(t, tensors[k]) for k, t in safetensors.torch.load_file(restored).items())
+
+
+@pytest.mark.parametrize("problem", ["no room", "out of memory"])
+def test_a_full_gpu_falls_back_to_the_cpu(problem, model_file, tmp_path, monkeypatch):
+    # Loading a model while another fills the GPU must not fail because the GPU is the faster place to decode.
+    tensors, path = model_file
+    compressed = str(tmp_path / "model.lossless.safetensors")
+    fileformat.compress_file(path, compressed)
+    devices, decode = [], codec.decode
+
+    def decode_on_a_full_gpu(blob, info):
+        devices.append(blob.device.type)
+        if problem == "out of memory" and len(devices) == 1:
+            raise codec.OUT_OF_MEMORY("CUDA out of memory")
+        return decode(blob, info)
+    monkeypatch.setattr(codec, "decode", decode_on_a_full_gpu)
+    monkeypatch.setattr(codec, "has_room", lambda device, needed: problem != "no room" and torch.device(device).type == "meta")
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    sent_to_gpu, real_to = [], torch.Tensor.to
+
+    def to(self, *args, **kwargs):  # "meta" stands in for the GPU; the data stays where it is
+        if args and str(args[0]) == "meta":
+            sent_to_gpu.append(self.numel())
+            return self
+        return real_to(self, *args, **kwargs)
+    monkeypatch.setattr(torch.Tensor, "to", to)
+    state_dict, _ = fileformat.load(compressed, device="meta")
+    monkeypatch.undo()
+
+    assert all(same_bits(state_dict[k], tensors[k]) for k in tensors)
+    if problem == "no room":
+        assert not sent_to_gpu and len(devices) == 2  # both blobs decoded on the CPU straight away
+    else:
+        assert len(sent_to_gpu) == 2 and len(devices) == 3  # the first one again after running out of memory
+
+
+def test_loading_the_pack_does_not_import_triton():
+    # Triton is only imported to decode kept-compressed weights on the GPU.
+    code = f"import sys; sys.path.insert(0, {REPO_ROOT!r}); from lossless import codec, fileformat, kernels; print('triton' in sys.modules)"
+    assert subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.strip() == "False"
 
 
 def test_verify_catches_a_corrupted_file(model_file, tmp_path):
@@ -251,7 +301,7 @@ def test_kept_compressed_checkpoint_samples_exactly_like_the_original(tiny_check
     assert torch.equal(sample(kept), sample(original))
 
 
-@pytest.mark.parametrize("dtype", list(codec.FORMATS), ids=str)
+@pytest.mark.parametrize("dtype", [dtype for dtype in codec.FORMATS if dtype.is_floating_point], ids=str)
 def test_keep_model_compressed_works_for_every_weight_dtype(tiny_diffusion_model, dtype):
     path = folder_paths.get_full_path("diffusion_models", tiny_diffusion_model)
     original = comfy.sd.load_diffusion_model(path, model_options={"dtype": dtype})
@@ -303,11 +353,65 @@ def test_keep_model_compressed_on_a_prequantized_fp8_model(tiny_fp8_quantized_mo
     assert same_bits(on_the_fly[0]._qdata, on_the_fly[1]._qdata) and torch.equal(on_the_fly[0]._params.scale, on_the_fly[1]._params.scale)
 
 
+def test_keep_model_compressed_on_an_int8_convrot_model(tiny_int8_convrot_model, monkeypatch):
+    from comfy.quant_ops import QuantizedTensor
+    original = nodes.UNETLoader().load_unet(tiny_int8_convrot_model, "default")[0]
+    kept = KeepModelCompressed.execute(original).args[0]
+
+    wrapped = [p for p in kept.model.diffusion_model.parameters() if memory.is_compressed(p) and p._params.inner]
+    assert wrapped and {p._params.inner for p in wrapped} == {"TensorWiseINT8Layout"}
+    assert {(p._params.convrot, p._params.convrot_groupsize) for p in wrapped} == {(True, 64), (True, 256)}
+    assert kept.model_size() < original.model_size()
+
+    # The int8 matmul gets ComfyUI's own int8 convrot weight back, and computes exactly the same.
+    weights_seen, linear = [], torch.nn.functional.linear
+
+    def spy(input, weight, bias=None):
+        if isinstance(weight, QuantizedTensor):
+            weights_seen.append((weight._layout_cls, weight._params.convrot))
+        return linear(input, weight, bias)
+    monkeypatch.setattr(torch.nn.functional, "linear", spy)
+    kept_output = sample(kept, steps=3)
+    assert weights_seen and set(weights_seen) == {("TensorWiseINT8Layout", True)}
+    monkeypatch.undo()
+    assert torch.equal(kept_output, sample(original, steps=3))
+
+    # LoRAs: baked into the weight (requantized to int8 convrot, then compressed), and applied on the fly.
+    layer = "diffusion_model.input_blocks.1.1.transformer_blocks.0.attn2.to_k.weight"
+    assert torch.equal(sample(with_lora(kept, layer), steps=3), sample(with_lora(original, layer), steps=3))
+    modules = [comfy.utils.get_attr(model.model, layer.removesuffix(".weight")) for model in (kept, original)]
+    patched = torch.randn(modules[0].weight.shape)
+    on_the_fly = [module.set_weight(patched.clone(), seed=3, return_weight=True) for module in modules]
+    assert not memory.is_compressed(on_the_fly[0]) and on_the_fly[0]._params.convrot
+    assert same_bits(on_the_fly[0]._qdata, on_the_fly[1]._qdata) and torch.equal(on_the_fly[0]._params.scale, on_the_fly[1]._params.scale)
+
+    # Saving writes the convrot settings, like for the original model.
+    marker = kept.model.diffusion_model.state_dict()[layer.removeprefix("diffusion_model.").replace(".weight", ".comfy_quant")]
+    assert json.loads(bytes(marker.tolist())) == {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256}
+
+
+def test_lossless_int8_convrot_file_loads_exactly(tiny_int8_convrot_model):
+    compressed = compress_in_comfyui("diffusion_models", tiny_int8_convrot_model)
+    sizes = [os.path.getsize(folder_paths.get_full_path("diffusion_models", name)) for name in (tiny_int8_convrot_model, compressed)]
+    assert sizes[1] < sizes[0] * 0.95
+    original = nodes.UNETLoader().load_unet(tiny_int8_convrot_model, "default")[0]
+    expected = sample(original, steps=3)
+    for keep_compressed in (False, True):
+        loaded = LoadDiffusionModelLossless.execute(compressed, keep_compressed).args[0]
+        assert loaded.model.model_config.quant_config is not None
+        assert torch.equal(sample(loaded, steps=3), expected)
+
+
 def test_fp8_compression_goes_before_keep_model_compressed(tiny_diffusion_model):
     model = nodes.UNETLoader().load_unet(tiny_diffusion_model, "default")[0]
     fp8_kept = KeepModelCompressed.execute(CompressModel.execute(model, "fp8_e4m3fn").args[0]).args[0]
     assert fp8_kept.model_dtype() == torch.float8_e4m3fn and compressed_weights(fp8_kept) > 0
     assert torch.isfinite(sample(fp8_kept, steps=2)).all()
+
+    int8 = CompressModel.execute(model, "int8_convrot").args[0]
+    int8_kept = KeepModelCompressed.execute(int8).args[0]
+    assert compressed_weights(int8_kept) > 0 and int8_kept.model_size() < int8.model_size()
+    assert torch.equal(sample(int8_kept, steps=2), sample(int8, steps=2))
 
     with pytest.raises(ValueError, match="before that node"):
         CompressModel.execute(KeepModelCompressed.execute(model).args[0], "fp8_e4m3fn")
@@ -321,8 +425,7 @@ DEVICES = ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.i
 def test_encodes_and_decodes_exactly_on_each_device(dtype, device):
     torch.manual_seed(0)
     patterns = every_bit_pattern(dtype)
-    weights = (torch.randn(10 * patterns.numel() + 5) * 0.02).to(dtype)
-    tensor = torch.cat([weights, patterns]).view(-1, 1)
+    tensor = torch.cat([weights(10 * patterns.numel() + 5, dtype), patterns]).view(-1, 1)
     blob, info = codec.encode(tensor.to(device))
     assert blob.device.type == device
     assert same_bits(codec.decode(blob, info).cpu(), tensor)
@@ -444,7 +547,7 @@ def test_decoding_stays_within_the_memory_reserved_for_it(dtype, shape, escapes,
     # Decoding takes memory next to the model; if ComfyUI reserves less than that, a full GPU runs over.
     monkeypatch.setitem(codec._NONZERO_STATIC, "cpu", escapes == "nonzero_static")
     torch.manual_seed(0)
-    weight = (torch.randn(shape) * (50 if dtype == torch.float8_e4m3fn else 0.02)).to(dtype)
+    weight = weights(shape, dtype)
     blob, params = memory.pack(weight, torch.ones(()), dtype, weight.shape, None)
     with PeakMemory(blob) as peak:
         decoded = codec.decode(blob, params.info)

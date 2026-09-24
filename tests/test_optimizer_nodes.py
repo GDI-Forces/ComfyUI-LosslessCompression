@@ -6,6 +6,7 @@ import torch
 import comfy.model_management
 import nodes
 from comfy.ldm.modules import attention as comfy_attention
+from comfy.quant_ops import QuantizedTensor
 from conftest import REPO_ROOT, sample
 from optimizer_nodes import CompactVRAMBeforeLoad, CompressModel, FreeVRAM, LoadCheckpointFP8, SpeedUpModel
 
@@ -167,6 +168,46 @@ def test_compress_model_must_come_before_torch_compile(tiny_checkpoint):
 def test_compressed_model_reloads_as_fp8(loaded_model):
     # torch.compile and multi-GPU copies reload the model this way
     assert compress(loaded_model).clone(force_deepcopy=True).model_dtype() == torch.float8_e4m3fn
+
+
+def int8_layers(model):
+    return [m.weight for m in model.model.diffusion_model.modules() if isinstance(getattr(m, "weight", None), QuantizedTensor)]
+
+
+def relative_error(output, reference):
+    return ((output - reference).abs().mean() / reference.abs().mean()).item()
+
+
+def test_compress_model_to_int8_convrot(loaded_model):
+    model = loaded_model
+    int8 = compress(model, "int8_convrot")
+
+    linear_layers = [m for m in model.model.diffusion_model.modules() if isinstance(m, torch.nn.Linear)]
+    assert len(int8_layers(int8)) == len(linear_layers)
+    assert all(w._layout_cls == "TensorWiseINT8Layout" and w._params.convrot for w in int8_layers(int8))
+    assert int8.model.model_config.quant_config is not None and not int8_layers(model)  # the input is left alone
+    assert int8.model_size() < model.model_size() * 0.75  # (the test model's conv layers stay fp32)
+
+    reference = sample(model)
+    error = relative_error(sample(int8), reference)
+    assert error < 1e-3 and error < relative_error(sample(compress(model, "fp8_e4m3fn")), reference)
+    assert int8_layers(int8.clone(force_deepcopy=True))  # reloads are int8 too
+
+
+def test_compress_model_to_int8_keeps_loras_and_options(tiny_checkpoint):
+    model = speed_up(load(tiny_checkpoint), step_cache=0.2)
+    patched = with_lora(model)
+
+    int8 = compress(patched, "int8_convrot")
+    assert int8.patches.keys() == patched.patches.keys()
+    assert int8.model_options["transformer_options"]["easycache"] is not None
+    assert not torch.allclose(sample(int8, steps=2), sample(compress(model, "int8_convrot"), steps=2), atol=1e-2)
+
+
+def test_int8_convrot_checkpoint(tiny_checkpoint):
+    int8 = load(tiny_checkpoint, "int8_convrot")
+    assert int8_layers(int8) and all(w._params.convrot for w in int8_layers(int8))
+    assert relative_error(sample(int8), sample(load(tiny_checkpoint, "default"))) < 1e-3
 
 
 def test_compact_vram_unloads_the_uncompressed_original(tiny_checkpoint):

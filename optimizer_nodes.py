@@ -6,6 +6,7 @@ so offloading, LoRAs and other model patches keep working.
 """
 import gc
 import inspect
+import json
 import logging
 import uuid
 
@@ -15,6 +16,7 @@ import comfy.model_management
 import comfy.patcher_extension
 import comfy.sd
 import folder_paths
+from comfy.quant_ops import QuantizedTensor
 from comfy.ldm.modules import attention as comfy_attention
 from comfy_api.latest import io
 from comfy_api.torch_helpers import set_torch_compile_wrapper
@@ -32,12 +34,16 @@ ATTENTION_OPTIONS = ["auto", "keep", "sage", "sage3", "flash", "xformers", "comf
 FP16_ACCUMULATION_KEY = "optimizer_fp16_accumulation"
 COMPACT_VRAM_KEY = "optimizer_compact_vram"
 
+INT8_CONVROT = "int8_convrot"
 WEIGHT_DTYPES = {
     "fp8_e4m3fn": torch.float8_e4m3fn,
     "fp8_e5m2": torch.float8_e5m2,
+    "int8_convrot": INT8_CONVROT,
     "default": None,
 }
 FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+CONVROT_GROUP_SIZES = (256, 64, 16)  # powers of 4, largest first
+MIN_INT8_ELEMENTS = 1 << 14  # smaller layers stay as they are
 
 
 def pick_attention(choice):
@@ -85,14 +91,15 @@ def compact_vram_wrapper(unload_other_models):
 
 
 def compress_model(model, dtype):
-    """A copy of the model whose weights are stored in `dtype`, keeping its LoRAs, patches and options.
+    """A copy of the model whose weights are stored in `dtype` (an fp8 dtype, or INT8_CONVROT), keeping its LoRAs,
+    patches and options.
 
-    The weights are rebuilt through the loader that made the model, the same way ComfyUI's
-    own weight_dtype options load them, and the input model is left untouched."""
+    The weights are rebuilt through the loader that made the model, the same way ComfyUI's own weight_dtype
+    options load them, and the input model is left untouched."""
     if model.model.model_config.quant_config is not None:
         logging.info("Compress Model: the model is already quantized (a ComfyUI mixed-precision file), leaving it as is.")
         return model
-    if model.model_dtype() in FP8_DTYPES:
+    if dtype != INT8_CONVROT and model.model_dtype() in FP8_DTYPES:
         logging.info(f"Compress Model: the model is already stored in {model.model_dtype()}, leaving it as is.")
         return model
     if model.get_wrappers(comfy.patcher_extension.WrappersMP.APPLY_MODEL, COMPILE_KEY):
@@ -106,12 +113,16 @@ def compress_model(model, dtype):
     loader, loader_args, *output_index = model.cached_patcher_init
     if "model_options" not in inspect.signature(loader).parameters:
         raise ValueError("Compress Model can't rebuild this model through its loader. "
-                         "If it went through Keep Model Compressed, put Compress Model (FP8) before that node.")
-    bound = inspect.signature(loader).bind(*loader_args)
-    bound.arguments["model_options"] = {**bound.arguments.get("model_options", {}), "dtype": dtype}
-    loaded = loader(*bound.args, **bound.kwargs, disable_dynamic=not model.is_dynamic())
-    if output_index:
-        loaded = loaded[output_index[0]]
+                         "If it went through Keep Model Compressed, put Compress Model before that node.")
+    disable_dynamic = not model.is_dynamic()
+    if dtype == INT8_CONVROT:
+        loaded = load_int8_convrot(model.cached_patcher_init, disable_dynamic=disable_dynamic)
+    else:
+        bound = inspect.signature(loader).bind(*loader_args)
+        bound.arguments["model_options"] = {**bound.arguments.get("model_options", {}), "dtype": dtype}
+        loaded = loader(*bound.args, **bound.kwargs, disable_dynamic=disable_dynamic)
+        if output_index:
+            loaded = loaded[output_index[0]]
 
     # Same approach as ModelPatcher.deepclone_multigpu: this model's patches on fresh weights.
     compressed = model.clone(model_override=(loaded.model, ({}, {}, {}, set())))
@@ -123,6 +134,66 @@ def compress_model(model, dtype):
     compressed.clone_base_uuid = uuid.uuid4()
     logging.info(f"Compress Model: {model.model_dtype()} -> {dtype} weights")
     return compressed
+
+
+def convrot_group_size(module):
+    """The ConvRot group size for a linear layer, or None to leave the layer as it is."""
+    weight = getattr(module, "weight", None)
+    if not isinstance(module, torch.nn.Linear) or not isinstance(weight, torch.Tensor) or isinstance(weight, QuantizedTensor):
+        return None
+    if not weight.is_floating_point() or weight.ndim != 2 or weight.numel() < MIN_INT8_ELEMENTS:
+        return None
+    return next((size for size in CONVROT_GROUP_SIZES if weight.shape[1] % size == 0), None)
+
+
+def quantize_int8_convrot(weight, group_size, device):
+    """(int8 data, per-output-channel scale) on the CPU. Rotates in float32, on `device` when there's room."""
+    def run(on):
+        quantized = QuantizedTensor.from_float(weight.to(on, torch.float32), "TensorWiseINT8Layout", per_channel=True,
+                                               convrot=True, convrot_groupsize=group_size)
+        return quantized._qdata.cpu(), quantized._params.scale.float().cpu()
+    if device.type != "cpu":
+        try:
+            return run(device)
+        except torch.cuda.OutOfMemoryError:
+            comfy.model_management.soft_empty_cache()
+    return run(torch.device("cpu"))
+
+
+def int8_convrot_state_dict(diffusion_model):
+    """The diffusion model's weights in the layout of ComfyUI's int8 convrot files: each eligible linear layer's
+    weight rotated and quantized to int8, its per-channel scale, and a comfy_quant marker saying so."""
+    device = comfy.model_management.get_torch_device()
+    modules = dict(diffusion_model.named_modules())
+    state_dict = {}
+    for key, tensor in diffusion_model.state_dict().items():
+        layer, _, name = key.rpartition(".")
+        group_size = convrot_group_size(modules.get(layer)) if name == "weight" else None
+        if group_size is None:
+            state_dict[key] = tensor
+            continue
+        state_dict[key], state_dict[f"{layer}.weight_scale"] = quantize_int8_convrot(tensor, group_size, device)
+        marker = {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": group_size}
+        state_dict[f"{layer}.comfy_quant"] = torch.tensor(list(json.dumps(marker).encode()), dtype=torch.uint8)
+    return state_dict
+
+
+def load_int8_convrot(init, disable_dynamic=False):
+    """Reload recipe for int8 convrot models: the original loader, then quantization. Also how they're made."""
+    loader, loader_args, *output_index = init
+    bound = inspect.signature(loader).bind(*loader_args)
+    options = {k: v for k, v in bound.arguments.get("model_options", {}).items() if k not in ("dtype", "fp8_optimizations")}
+    bound.arguments["model_options"] = options
+    original = loader(*bound.args, **bound.kwargs, disable_dynamic=True)
+    if output_index:
+        original = original[output_index[0]]
+    state_dict = int8_convrot_state_dict(original.model.diffusion_model)
+    del original
+    model = comfy.sd.load_diffusion_model_state_dict(state_dict, model_options=options, disable_dynamic=disable_dynamic)
+    if model is None:
+        raise RuntimeError("Could not rebuild the model with int8 convrot weights.")
+    model.cached_patcher_init = (load_int8_convrot, (init,))
+    return model
 
 
 def compute_dtype(model):
@@ -203,15 +274,17 @@ class LoadCheckpointFP8(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="OptimizerLoadCheckpointFP8",
-            display_name="Load Checkpoint (FP8, Low VRAM)",
+            display_name="Load Checkpoint (FP8/INT8, Low VRAM)",
             category=CATEGORY,
-            search_aliases=["fp8 checkpoint", "low vram checkpoint", "load checkpoint"],
-            description="Loads a checkpoint with the diffusion model's weights stored in fp8, "
+            search_aliases=["fp8 checkpoint", "int8 checkpoint", "convrot", "low vram checkpoint", "load checkpoint"],
+            description="Loads a checkpoint with the diffusion model's weights stored in fp8 or int8, "
                         "which halves the VRAM they take compared to fp16 or bf16.",
             inputs=[
                 io.Combo.Input("ckpt_name", options=folder_paths.get_filename_list("checkpoints")),
                 io.Combo.Input("weight_dtype", options=list(WEIGHT_DTYPES), default="fp8_e4m3fn",
                                tooltip="fp8_e4m3fn keeps more precision and suits most models. fp8_e5m2 keeps more range. "
+                                       "int8_convrot rotates each linear layer's weights before quantizing them to int8 (like "
+                                       "ComfyUI's int8 convrot models), which keeps the most precision and uses int8 matmuls. "
                                        "default loads the weights like the regular checkpoint loader."),
             ],
             outputs=[io.Model.Output(), io.Clip.Output(), io.Vae.Output()],
@@ -220,14 +293,15 @@ class LoadCheckpointFP8(io.ComfyNode):
     @classmethod
     def execute(cls, ckpt_name, weight_dtype) -> io.NodeOutput:
         ckpt_path = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
-        model_options = {}
-        if WEIGHT_DTYPES[weight_dtype] is not None:
-            model_options["dtype"] = WEIGHT_DTYPES[weight_dtype]
+        dtype = WEIGHT_DTYPES[weight_dtype]
+        model_options = {"dtype": dtype} if dtype not in (None, INT8_CONVROT) else {}
         model, clip, vae = comfy.sd.load_checkpoint_guess_config(
             ckpt_path, output_vae=True, output_clip=True,
             embedding_directory=folder_paths.get_folder_paths("embeddings"),
             model_options=model_options,
         )[:3]
+        if dtype == INT8_CONVROT:
+            model = compress_model(model, INT8_CONVROT)
         return io.NodeOutput(model, clip, vae)
 
 
@@ -236,16 +310,18 @@ class CompressModel(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="OptimizerCompressModel",
-            display_name="Compress Model (FP8)",
+            display_name="Compress Model (FP8/INT8)",
             category=CATEGORY,
-            search_aliases=["fp8", "quantize model", "compress vram", "low vram"],
-            description="Stores the model's weights in fp8, which halves the VRAM they need compared to fp16 or bf16. "
+            search_aliases=["fp8", "int8", "convrot", "quantize model", "compress vram", "low vram"],
+            description="Stores the model's weights in fp8 or int8, which halves the VRAM they need compared to fp16 or bf16. "
                         "Works on a model from any core loader, and keeps LoRAs and other patches already applied to it. "
                         "Put it right after the loader or LoRAs.",
             inputs=[
                 io.Model.Input("model"),
                 io.Combo.Input("weight_dtype", options=[k for k, v in WEIGHT_DTYPES.items() if v is not None], default="fp8_e4m3fn",
-                               tooltip="fp8_e4m3fn keeps more precision and suits most models. fp8_e5m2 keeps more range."),
+                               tooltip="fp8_e4m3fn keeps more precision and suits most models. fp8_e5m2 keeps more range. "
+                                       "int8_convrot rotates each linear layer's weights before quantizing them to int8 (like "
+                                       "ComfyUI's int8 convrot models), which keeps the most precision and uses int8 matmuls."),
             ],
             outputs=[io.Model.Output()],
         )

@@ -3,7 +3,7 @@
 The loaders decode the file back into the exact original weights and hand them to
 ComfyUI's normal loading code, so a compressed model behaves bit for bit like the
 original. Each loader records how to reload its model, so torch.compile, multi-GPU
-and Compress Model (FP8) work with it like with the built-in loaders.
+and Compress Model work with it like with the built-in loaders.
 """
 import logging
 import os
@@ -53,7 +53,7 @@ def keep_weights_compressed(model, name):
     if layers and device.type == "cuda" and not memory.kernels.usable(device):
         logging.info("Lossless: install Triton (triton-windows on Windows) to decode compressed weights much faster.")
     if layers == 0:
-        logging.warning(f"{name}: no weights could be kept compressed; int8 and 4-bit layers don't compress.")
+        logging.warning(f"{name}: no weights could be kept compressed; 4-bit layers don't compress.")
     else:
         logging.info(f"{name}: {layers} layer weights kept compressed, {before / 1024 ** 3:.2f} GB -> "
                      f"{after / 1024 ** 3:.2f} GB ({100 * (1 - after / before):.1f}% less memory)")
@@ -215,9 +215,10 @@ class KeepModelCompressed(io.ComfyNode):
             search_aliases=["lossless vram", "compress vram", "low vram", "keep compressed"],
             description="Keeps the model's weights losslessly compressed in RAM and VRAM and decodes each layer when it "
                         "runs. Results are exactly the same; the weights need less memory (about 31% less for bf16, 22-26% for fp8, "
-                        "16% for fp32, 13% for fp16 and for ComfyUI's pre-quantized fp8 files) but every step is slower; "
-                        "install Triton to decode with a single GPU kernel. Works after any core loader; int8 and 4-bit layers "
-                        "are left as they are.",
+                        "16% for fp32, 13% for fp16 and for ComfyUI's pre-quantized fp8 files, 9-23% for int8 convrot) but "
+                        "every step is slower; "
+                        "install Triton to decode with a single GPU kernel. Works after any core loader, with fp8 and int8 "
+                        "(including int8 convrot) models too; 4-bit layers are left as they are.",
             inputs=[io.Model.Input("model")],
             outputs=[io.Model.Output()],
         )

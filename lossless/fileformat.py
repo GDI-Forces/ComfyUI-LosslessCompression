@@ -83,7 +83,9 @@ def compress_file(src, dst, on_tensor=None, device=None):
         nonlocal original, written
         for done, (name, tensor) in enumerate(tensors, 1):
             original += tensor.nbytes
-            encoded = codec.encode(tensor.to(device) if device else tensor) if tensor.numel() >= MIN_ELEMENTS else None
+            encoded = None
+            if tensor.numel() >= MIN_ELEMENTS:
+                encoded = codec.run_on(device, codec.encode_memory(tensor), lambda on: _encode(tensor, on))
             if encoded is None:
                 written += tensor.nbytes
                 yield name, tensor
@@ -116,10 +118,20 @@ def load(path, device=None):
             tensor = f.get(key)
             if key.endswith(BLOB_SUFFIX):
                 name = key[:-len(BLOB_SUFFIX)]
-                state_dict[name] = codec.decode(tensor.to(device) if device else tensor, infos[name]).cpu()
+                state_dict[name] = _decode(tensor, infos[name], device)
             else:
                 state_dict[key] = tensor
     return state_dict, json.loads(metadata[METADATA_KEY]) or None
+
+
+def _encode(tensor, device):
+    encoded = codec.encode(tensor.to(device))
+    return None if encoded is None else (encoded[0].cpu(), encoded[1])
+
+
+def _decode(blob, info, device):
+    """Decodes a blob on `device` when it has room (the GPU is much faster), else on the CPU; returns it on the CPU."""
+    return codec.run_on(device, codec.decode_memory(blob, info), lambda on: codec.decode(blob.to(on), info).cpu())
 
 
 def verify(original, compressed, device=None):
@@ -137,7 +149,7 @@ def verify(original, compressed, device=None):
             if name in infos:
                 remaining.discard(name + BLOB_SUFFIX)
                 blob = f.get(name + BLOB_SUFFIX)
-                restored = codec.decode(blob.to(device) if device else blob, infos[name]).cpu()
+                restored = _decode(blob, infos[name], device)
             elif name in remaining:
                 remaining.discard(name)
                 restored = f.get(name)

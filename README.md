@@ -8,8 +8,8 @@ hooks, so its memory manager, LoRAs and other model patches keep working.
 | Node | What it does |
 | --- | --- |
 | **Speed Up Model** | Faster attention (SageAttention / FlashAttention), fp16 accumulation, step caching and `torch.compile`, from one node. |
-| **Load Checkpoint (FP8, Low VRAM)** | Loads a checkpoint with the diffusion model stored in fp8, halving the VRAM its weights need. |
-| **Compress Model (FP8)** | Converts any loaded model's weights to fp8, halving their VRAM, and keeps LoRAs and patches. |
+| **Load Checkpoint (FP8/INT8, Low VRAM)** | Loads a checkpoint with the diffusion model stored in fp8 or int8 convrot, halving the VRAM its weights need. |
+| **Compress Model (FP8/INT8)** | Converts any loaded model's weights to fp8 or int8 convrot, halving their VRAM, and keeps LoRAs and patches. |
 | **Compact VRAM Before Load** | Right before a model loads onto the GPU, unloads the other models and clears cached memory so it gets the most free VRAM. |
 | **Free VRAM** | Passthrough node that unloads models and clears the GPU cache between stages of a workflow. |
 | **Compress Model File (Lossless)** | Writes a smaller copy of a model file whose weights decode to exactly the original bits. |
@@ -59,19 +59,18 @@ The node logs what it applied, e.g. `Speed Up Model: sage attention, step cache 
 Its step cache always uses EasyCache's default 15%–95% window. For finer control, use the
 built-in **EasyCache** node instead and leave `step_cache` at 0.
 
-### Load Checkpoint (FP8, Low VRAM)
+### Load Checkpoint (FP8/INT8, Low VRAM)
 
-This is a drop-in replacement for `Load Checkpoint`. It stores the diffusion model's weights in fp8 and
-converts each layer back up as it runs. The weights take half the VRAM of fp16/bf16, so a
-model that used to spill into system RAM can fit on the GPU.
-`fp8_e4m3fn` suits most models. `default` behaves like the regular loader, which is handy for A/B comparisons.
-For standalone diffusion model files, the built-in `Load Diffusion Model` node already has a
-`weight_dtype` option that does the same.
+This is a drop-in replacement for `Load Checkpoint`. It stores the diffusion model's weights in fp8 or int8
+convrot (see below). The weights take half the VRAM of fp16/bf16, so a model that used to spill into system RAM
+can fit on the GPU. `fp8_e4m3fn` suits most models. `default` behaves like the regular loader, which is handy
+for A/B comparisons. For standalone diffusion model files, the built-in `Load Diffusion Model` node already has a
+`weight_dtype` fp8 option; use **Compress Model (FP8/INT8)** after it for int8 convrot.
 
-### Compress Model (FP8)
+### Compress Model (FP8/INT8)
 
 Takes a model from any core loader (`Load Diffusion Model`, `Load Checkpoint`, including after LoRAs) and outputs
-a copy whose weights are stored in fp8. Each layer is converted back up as it runs. The weights need half the VRAM
+a copy whose weights are stored in fp8 or int8 convrot. With fp8, each layer is converted back up as it runs. The weights need half the VRAM
 of fp16/bf16: roughly 14 GB instead of 28 GB for Wan 14B, 12 GB instead of 24 GB for Flux, 2.5 GB instead of 5 GB
 for an SDXL UNet. The console confirms it, e.g. `Compress Model: torch.bfloat16 -> torch.float8_e4m3fn weights`.
 
@@ -83,6 +82,14 @@ for an SDXL UNet. The console confirms it, e.g. `Compress Model: torch.bfloat16 
   compressed) stop the workflow with an error explaining this.
 - fp8 is lossy. Results change a little, usually not visibly. `fp8_e4m3fn` suits most models.
 - If your loader already has a `weight_dtype` option, setting fp8 there saves the same VRAM and a bit of loading time.
+
+`int8_convrot` makes the same kind of model as ComfyUI's int8 convrot files. Each linear layer's weights
+are rotated in groups (a Hadamard transform, which spreads outliers evenly) and stored as int8 with one scale per
+output channel. ComfyUI then runs those layers with int8 matmuls and handles LoRAs, offloading and saving
+for them as usual. It takes the same VRAM as fp8 but keeps more precision: on the test model its output
+differed from the original about 8 times less than fp8's did. Layers whose input width isn't a multiple of 16,
+very small layers and convolutions keep their original precision. Loading takes longer, because every layer is
+rotated and quantized (on the GPU when there is room). Models that are already quantized pass through unchanged.
 
 ### Compact VRAM Before Load
 
@@ -105,9 +112,9 @@ when next used, so leave it out of workflows where everything already fits.
 
 ## Lossless model compression
 
-The fp8 nodes save more memory but change the weights slightly. The lossless tools keep every weight
-**bit for bit identical**, in whatever dtype it already has (fp32, fp16, bf16, fp8), so results are exactly
-the same as with the original file.
+The fp8 and int8 nodes save more memory but change the weights slightly. The lossless tools keep every weight
+**bit for bit identical**, in whatever dtype it already has (fp32, fp16, bf16, fp8, int8), so results are
+exactly the same as with the original file.
 
 How much it saves, measured on 25M real trained parameters (every tensor verified bit-exact):
 
@@ -117,6 +124,12 @@ How much it saves, measured on 25M real trained parameters (every tensor verifie
 | fp8 e5m2 / e4m3fn | 25% / 22% (13% for e4m3fn files scaled per tensor) | 27% / 24% (16%) |
 | fp32 | 16% | 16% |
 | fp16 | 13% | 13% |
+| int8 convrot (ComfyUI's int8 convrot files) | 9–23% | 11–25% |
+| int8 without rotation | 9–61% | 11–72% |
+
+The int8 rows are measured on weights quantized here, from layers with and without a few outlier channels
+(no real int8 model was available to measure). Rotation spreads the int8 values over their whole range, which
+is good for precision and leaves less to compress. The more outliers a layer has, the more it saves.
 
 For example, a 28 GB bf16 model becomes about 19 GB. Lossless compression can't go much further: in trained
 weights the sign and mantissa bits are close to random, and only the exponent bits are predictable. The tools
@@ -160,7 +173,8 @@ results stay exactly the same. How much less memory the weights take:
 | fp32 | ~16% |
 | fp16 | ~13% |
 | ComfyUI's pre-quantized fp8 e4m3fn files (scaled per tensor) | ~13% |
-| int8 or 4-bit (nvfp4 and similar) layers | none; they are left as they are, since their data doesn't compress |
+| ComfyUI's int8 convrot files, or int8 convrot from Compress Model (FP8/INT8) | ~9–23% (int8 without rotation: more) |
+| 4-bit (nvfp4 and similar) layers | none; they are left as they are, since their packed data doesn't compress |
 
 The console reports what it did, e.g.
 `Keep Model Compressed: 312 layer weights kept compressed, 12.10 GB -> 10.52 GB (13.1% less memory)`.
@@ -169,24 +183,26 @@ theoretical limit for them is about 16%.
 
 Things to know:
 
-- Every step gets slower, because each layer is decoded every time it runs. fp8 layers decode straight back into
-  ComfyUI's fp8 format and then use its normal fp8 kernels. If the smaller model now fits entirely on your GPU
-  where it didn't before, avoiding the constant swapping of weights may make up for it.
+- Every step gets slower, because each layer is decoded every time it runs. fp8 and int8 layers decode straight
+  back into ComfyUI's own format, int8 convrot settings included, and then use its normal fp8 or int8 kernels.
+  If the smaller model now fits entirely on your GPU where it didn't before, avoiding the constant swapping of
+  weights may make up for it.
 - **Install Triton for speed.** With Triton, each weight is decoded by one GPU kernel that reads the compressed
   bytes once and writes the weight once. Without it, a PyTorch decoder runs a few dozen small GPU operations per
   weight instead. On Windows install `triton-windows` in ComfyUI's Python, in the version that matches your
   PyTorch (for PyTorch 2.8: `python_embeded\python.exe -m pip install "triton-windows<3.5"`). The portable build's
   embedded Python also needs the `include` and `libs` folders described in the triton-windows instructions. The
   console says `Lossless: decoding compressed weights with Triton.` once the kernel is in use; otherwise it
-  suggests installing Triton. The kernel checks its first result for each weight format against the PyTorch
-  decoder, and if they ever differ, or Triton fails to compile, it switches itself off and logs why.
+  suggests installing Triton. Triton is only imported at that point, never while loading files. The kernel
+  checks its first result for each weight format against the PyTorch decoder, and if they ever differ, or
+  Triton fails to compile, it switches itself off and logs why.
 - Decoding needs some VRAM next to the model: room for the decoded layer, plus a few bytes per value for the
   PyTorch decoder. These models tell ComfyUI how much, so it keeps that much free when it decides how much of
   the model to load. (Earlier versions didn't, and their decoder needed several times more temporary memory.
   On a nearly full GPU that can go over the limit, and on Windows the driver then moves the overflow to shared
   GPU memory in system RAM: the likely cause of generations getting slower one after another.)
 - These models use ComfyUI's classic memory manager rather than DynamicVRAM.
-- To combine it with **Compress Model (FP8)**, put that node first. It hasn't been tried with `torch.compile`.
+- To combine it with **Compress Model (FP8/INT8)**, put that node first. It hasn't been tried with `torch.compile`.
 - Task Manager's VRAM figure includes memory ComfyUI keeps cached, so it can look unchanged. The console's
   "loaded completely/partially … MB" line shows how much the model really takes.
 
@@ -203,7 +219,8 @@ python custom_nodes/ComfyUINodeTest/lossless_compress.py decompress model.lossle
 ```
 
 `compress` verifies its output unless you pass `--no-verify`. `decompress` gives back a regular `.safetensors`
-file with the original tensors and metadata, so nothing is ever locked into this format.
+file with the original tensors and metadata, so nothing is ever locked into this format. Files are encoded and
+decoded on the GPU when it has room, and on the CPU otherwise (for example while another model fills the GPU).
 
 ### Limits
 

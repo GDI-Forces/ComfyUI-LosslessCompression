@@ -9,9 +9,10 @@ compressed bytes stay resident. The price is decoding each layer's weight every
 time it runs.
 
 Plain weights in any float format (fp32, fp16, bf16, fp8) are compressed as they
-are. Layers of ComfyUI's pre-quantized fp8 files keep their fp8 data compressed
-and get their own quantized tensor back right before their fp8 kernel runs.
-Other quantized formats (int8, 4-bit) are left alone: their data doesn't compress.
+are. Layers of ComfyUI's pre-quantized fp8 and int8 files (int8 convrot included)
+keep their fp8 or int8 data compressed and get their own quantized tensor back,
+with all its layout settings, right before their fp8 or int8 kernel runs. 4-bit
+formats are left alone: their packed data doesn't compress.
 
 On the GPU the weights are decoded by a Triton kernel when Triton is installed
 (kernels.py), otherwise by the PyTorch decoder. Either way decoding needs some
@@ -19,6 +20,7 @@ memory next to the model. That is added to ComfyUI's estimate of what sampling
 needs, so ComfyUI keeps it free instead of the GPU running out mid-step.
 """
 import dataclasses
+import types
 
 import torch
 
@@ -30,14 +32,23 @@ from . import codec, kernels
 
 LAYOUT = "LosslessLayout"
 MIN_ELEMENTS = 4096
-INNER_PARAMS = {"scale", "orig_dtype", "orig_shape"}  # quantized layouts whose data can be wrapped (fp8)
+BASE_FIELDS = {"scale", "orig_dtype", "orig_shape"}
 CHUNK = 1 << 23  # values the PyTorch decoder handles at a time; bounds its temporary memory
 
 
 @dataclasses.dataclass(frozen=True)
 class LosslessParams(BaseLayoutParams):
-    info: dict = None   # how to decode the data
-    inner: str = None   # the ComfyUI quantized layout the data belongs to, or None for a plain weight
+    info: dict = None          # how to decode the data
+    inner: str = None          # the ComfyUI quantized layout the data belongs to, or None for a plain weight
+    inner_fields: dict = None  # that layout's other settings, e.g. int8's convrot and convrot_groupsize
+
+    def __getattr__(self, name):
+        # ComfyUI reads layout settings off a weight's params (convrot when saving, transposed before int8
+        # matmuls); answer with the inner layout's.
+        fields = self.__dict__.get("inner_fields")
+        if fields and name in fields:
+            return fields[name]
+        raise AttributeError(name)
 
 
 class LosslessLayout(QuantizedLayout):
@@ -50,7 +61,7 @@ class LosslessLayout(QuantizedLayout):
             return pack(tensor, torch.ones((), device=tensor.device), tensor.dtype, tuple(tensor.shape), None)
         quantized = QuantizedTensor.from_float(tensor, inner, **kwargs)
         params = quantized._params
-        return pack(quantized._qdata, params.scale, params.orig_dtype, params.orig_shape, inner)
+        return pack(quantized._qdata, params.scale, params.orig_dtype, params.orig_shape, inner, inner_fields=extra_fields(params))
 
     @classmethod
     def dequantize(cls, qdata, params):
@@ -61,7 +72,11 @@ class LosslessLayout(QuantizedLayout):
 
     @classmethod
     def requantize_kwargs(cls, qtensor):
-        return {"inner": qtensor._params.inner}
+        # What requantizing the inner layout takes (int8 convrot: per-channel, convrot and its group size).
+        params = qtensor._params
+        if params.inner is None:
+            return {"inner": None}
+        return {"inner": params.inner, **inner_requantize_kwargs(params)}
 
     @classmethod
     def get_plain_tensors(cls, qtensor):
@@ -74,24 +89,32 @@ class LosslessLayout(QuantizedLayout):
         if params.inner is None:
             return {"": QuantizedTensor(qdata, LAYOUT, params)}
         data_dtype = codec.DTYPE_NAMES[params.info.get("raw", params.info.get("dtype"))]
-        data = dataclasses.replace(params, scale=torch.ones((), device=qdata.device), orig_dtype=data_dtype, inner=None)
+        data = dataclasses.replace(params, scale=torch.ones((), device=qdata.device), orig_dtype=data_dtype, inner=None, inner_fields=None)
         return {"": QuantizedTensor(qdata, LAYOUT, data), "_scale": params.scale}
 
 
 register_layout_class(LAYOUT, LosslessLayout)
 
 
-def pack(data, scale, orig_dtype, orig_shape, inner, compress_on=None):
-    """(blob, params) for `data`; data that doesn't compress is kept as raw bytes."""
-    encoded = codec.encode(data.to(compress_on) if compress_on else data, chunk=CHUNK)
+def pack(data, scale, orig_dtype, orig_shape, inner, compress_on=None, inner_fields=None):
+    """(blob, params) for `data`; data that doesn't compress is kept as raw bytes. Encodes on `compress_on`
+    (by default where the data is) when it has room, else on the CPU, and returns the blob on data's device."""
+    def compress(device):
+        encoded = codec.encode(data.to(device), chunk=CHUNK)
+        if encoded is None:
+            return None
+        blob, info = encoded
+        if kernels.installed():
+            blob, info = kernels.attach(blob, info)
+        return blob.to(data.device), info
+
+    encoded = codec.run_on(compress_on or data.device, codec.encode_memory(data, CHUNK), compress)
     if encoded is None:
         blob, info = data.contiguous().reshape(-1).view(torch.uint8), {"raw": str(data.dtype).removeprefix("torch."), "shape": list(data.shape)}
     else:
         blob, info = encoded
-        if kernels.installed():
-            blob, info = kernels.attach(blob, info)
-        blob = blob.to(data.device)
-    return blob, LosslessParams(scale=scale, orig_dtype=orig_dtype, orig_shape=tuple(orig_shape), info=info, inner=inner)
+    return blob, LosslessParams(scale=scale, orig_dtype=orig_dtype, orig_shape=tuple(orig_shape), info=info, inner=inner,
+                                inner_fields=inner_fields or None)
 
 
 @torch.compiler.disable  # plain eager code; torch.compile would recompile it for every layer
@@ -105,9 +128,32 @@ def decode(qdata, info):
     return codec.decode(qdata, info)
 
 
-def inner_tensor(data, params):
+def inner_params(params):
+    """The inner layout's own params for a compressed weight."""
     layout = get_layout_class(params.inner)
-    return QuantizedTensor(data, params.inner, layout.Params(scale=params.scale, orig_dtype=params.orig_dtype, orig_shape=params.orig_shape))
+    return layout.Params(scale=params.scale, orig_dtype=params.orig_dtype, orig_shape=params.orig_shape, **(params.inner_fields or {}))
+
+
+def inner_tensor(data, params):
+    return QuantizedTensor(data, params.inner, inner_params(params))
+
+
+def inner_requantize_kwargs(params):
+    """The inner layout's requantize_kwargs, which only look at params."""
+    return get_layout_class(params.inner).requantize_kwargs(types.SimpleNamespace(_params=inner_params(params)))
+
+
+def extra_fields(params):
+    """A quantized layout's settings besides scale, dtype and shape."""
+    return {f.name: getattr(params, f.name) for f in dataclasses.fields(params) if f.name not in BASE_FIELDS}
+
+
+def can_wrap(weight):
+    """Whether a ComfyUI quantized weight's data can be compressed: fp8 or int8 data, and no tensor settings
+    besides its scale (4-bit layouts have more, and their packed data doesn't compress)."""
+    params = weight._params
+    tensor_fields = params._tensor_fields() if hasattr(params, "_tensor_fields") else None
+    return weight._qdata.dtype in codec.FORMATS and tensor_fields == ["scale"] and BASE_FIELDS <= {f.name for f in dataclasses.fields(params)}
 
 
 def is_compressed(weight):
@@ -155,10 +201,9 @@ class QuantizedLayer:
         current = self.weight
         if return_weight and is_compressed(current) and current._params.inner is not None:
             # A LoRA applied on the fly to an offloaded layer, for one forward pass: quantize the result the way
-            # ComfyUI does (requantize_from_float of the fp8 weight), but don't compress it only to decode it again.
-            quantized = QuantizedTensor.from_float(weight, current._params.inner, scale="recalculate",
-                                                   stochastic_rounding=seed, inplace_ops=True)
-            return quantized.to(current.dtype)
+            # ComfyUI does (requantize_from_float of the fp8 or int8 weight), but don't compress it only to decode it again.
+            options = {**inner_requantize_kwargs(current._params), "scale": "recalculate", "stochastic_rounding": seed, "inplace_ops": True}
+            return QuantizedTensor.from_float(weight, current._params.inner, **options).to(current.dtype)
         return super().set_weight(weight, inplace_update=inplace_update, seed=seed, return_weight=return_weight, **kwargs)
 
 
@@ -174,18 +219,18 @@ def compressed_class(cls, hooks):
 
 def compress_module(module, compress_on=None):
     """Replaces a ComfyUI layer's weight with a compressed copy, in place. Returns (bytes before, bytes after),
-    or None when the layer is left alone (not a ComfyUI layer, too small, int8/4-bit, or doesn't compress)."""
+    or None when the layer is left alone (not a ComfyUI layer, too small, 4-bit, or doesn't compress)."""
     weight = getattr(module, "weight", None)
     if not isinstance(module, comfy.ops.CastWeightBiasOp) or not isinstance(weight, torch.Tensor) or weight.numel() < MIN_ELEMENTS:
         return None
     if isinstance(weight, QuantizedTensor):
         params = weight._params
-        if (weight._qdata.dtype not in codec.FORMATS or not hasattr(module, "_forward")
-                or {f.name for f in dataclasses.fields(params)} != INNER_PARAMS):
+        if not can_wrap(weight) or not hasattr(module, "_forward"):
             return None
         data = weight._qdata
-        blob, new_params = pack(data, params.scale, params.orig_dtype, params.orig_shape, weight._layout_cls, compress_on)
-    elif weight.dtype in codec.FORMATS and weight.ndim >= 2:
+        blob, new_params = pack(data, params.scale, params.orig_dtype, params.orig_shape, weight._layout_cls, compress_on,
+                                inner_fields=extra_fields(params))
+    elif weight.dtype in codec.FORMATS and weight.is_floating_point() and weight.ndim >= 2:
         data = weight
         blob, new_params = pack(data, torch.ones((), device=weight.device), weight.dtype, weight.shape, None, compress_on)
     else:

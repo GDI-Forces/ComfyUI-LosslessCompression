@@ -1,4 +1,4 @@
-"""Bit-exact compression of floating point tensors.
+"""Bit-exact compression of floating point and int8 tensors.
 
 A float is sign, exponent and mantissa bits. In trained weights the sign and
 mantissa bits are close to random, but only a handful of exponent values occur,
@@ -11,6 +11,11 @@ so the exponent is where the savings are:
   level that stores them raw. Each level is a dense stream in element order, so
   decoding needs no positions: the escapes are filled back in order.
 
+int8 weights (ComfyUI's int8 and int8 convrot models) go through the same code:
+their low 7 bits are first XORed with the sign bit, which leaves the sign on top
+and the magnitude below it, so the top magnitude bits play the exponent's part.
+Which bits count as "exponent" is picked per tensor.
+
 Everything is plain PyTorch, so decoding runs on the CPU or the GPU. Level-1
 codes are processed in fixed-size chunks to bound temporary memory, and the
 escape count of every chunk is recorded so decoding never waits on the GPU.
@@ -18,6 +23,7 @@ Decoding works on bytes: the output is assembled byte by byte in place, and
 besides the escape positions and table lookups (done in small pieces), each
 temporary takes one byte per value.
 """
+import logging
 import sys
 
 import torch
@@ -31,7 +37,17 @@ FORMATS = {
     torch.float16: (torch.int16, 5, 10),
     torch.float8_e4m3fn: (torch.uint8, 4, 3),
     torch.float8_e5m2: (torch.uint8, 5, 2),
+    torch.int8: (torch.uint8, 4, 3),  # "exponent" = top magnitude bits; see SPLITS
 }
+# Formats whose split into exponent and mantissa is picked per tensor, best first when tied.
+SPLITS = {torch.int8: [(4, 3), (5, 2), (6, 1), (3, 4)]}
+FOLDED = {torch.int8}  # stored with the low 7 bits XORed with the sign bit
+
+
+def layout(info):
+    """(integer view, exponent bits, mantissa bits) of an encoded tensor."""
+    view, e, m = FORMATS[DTYPE_NAMES[info["dtype"]]]
+    return (view, *info["split"]) if "split" in info else (view, e, m)
 DTYPE_NAMES = {str(dtype).removeprefix("torch."): dtype for dtype in FORMATS}
 
 CHUNK = 1 << 24  # level-1 elements decoded at a time; a multiple of 8
@@ -92,12 +108,15 @@ def unpack_bits(packed, width, count):
     return values.view(-1)[:count]
 
 
-def split_bits(flat, dtype):
+def split_bits(flat, dtype, e=None, m=None):
     """(exponent, rest) of every element of a flat chunk as int32; rest is the sign above the mantissa."""
-    view, e, m = FORMATS[dtype]
+    view, e0, m0 = FORMATS[dtype]
+    e, m = (e0, m0) if e is None else (e, m)
     bits = flat.view(view).to(torch.int32)
     if view != torch.int32:
         bits &= (1 << (1 + e + m)) - 1  # undo sign extension of int16
+    if dtype in FOLDED:
+        bits ^= (bits >> 7) * 0x7F
     exponent = (bits >> m) & ((1 << e) - 1)
     rest = (((bits >> (e + m)) & 1) << m) | (bits & ((1 << m) - 1))
     return exponent, rest
@@ -124,6 +143,44 @@ def plan_levels(counts, e):
     return best
 
 
+OUT_OF_MEMORY = getattr(torch, "OutOfMemoryError", torch.cuda.OutOfMemoryError)
+HEADROOM = 256 << 20  # VRAM left free when deciding whether work fits on the GPU
+ENCODE_MEMORY_PER_VALUE = 32  # temporaries of encode(), per value of a chunk
+
+
+def has_room(device, needed):
+    """Whether `device` has `needed` bytes free, counting memory PyTorch holds cached. Only checked for CUDA."""
+    device = torch.device(device)
+    if device.type != "cuda":
+        return True
+    free, _ = torch.cuda.mem_get_info(device)
+    free += torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    return needed + HEADROOM <= free
+
+
+def run_on(device, needed, work, fallback="cpu"):
+    """work(device) when `device` is set and has room for `needed` bytes, else (or if it runs out of memory
+    anyway) work(fallback). Loading a model while another one fills the GPU must not fail just because the
+    GPU is the faster place to encode or decode."""
+    if device is not None and has_room(device, needed):
+        try:
+            return work(device)
+        except OUT_OF_MEMORY:
+            torch.cuda.empty_cache()
+            logging.warning(f"Lossless: not enough memory on {device}, using the {fallback} for this tensor.")
+    return work(fallback)
+
+
+def encode_memory(tensor, chunk=None):
+    """About how much device memory encode() takes for a tensor, including the tensor itself."""
+    return 2 * tensor.nbytes + ENCODE_MEMORY_PER_VALUE * min(tensor.numel(), chunk or CHUNK)
+
+
+def decode_memory(blob, info):
+    """How much device memory decode() takes for a blob, including the blob and the result."""
+    return blob.nbytes + info["counts"][0] * DTYPE_NAMES[info["dtype"]].itemsize + temporary_memory(info)
+
+
 def encode(tensor, chunk=None):
     """(blob, info) for a tensor, or None when compressing it wouldn't save at least 1%.
     Runs on the tensor's device and returns the blob there. `chunk` (a multiple of 8, CHUNK by default) bounds
@@ -131,15 +188,20 @@ def encode(tensor, chunk=None):
     chunk_size = chunk or CHUNK
     if tensor.dtype not in FORMATS or tensor.numel() == 0:
         return None
-    _, e, m = FORMATS[tensor.dtype]
     device = tensor.device
     chunks = tensor.detach().contiguous().view(-1).split(chunk_size)
     n = tensor.numel()
 
-    counts = sum(torch.bincount(split_bits(c, tensor.dtype)[0], minlength=1 << e) for c in chunks)
-    order = counts.argsort(descending=True, stable=True)
-    widths, exponent_bits = plan_levels(counts[order][:int((counts > 0).sum())].tolist(), e)
-    if not widths or n * (1 + m) + exponent_bits > n * (1 + e + m) * (1 - MIN_SAVING):
+    # Plan the exponent codes for each candidate split and keep the smallest.
+    best = None
+    for e, m in SPLITS.get(tensor.dtype, [FORMATS[tensor.dtype][1:]]):
+        counts = sum(torch.bincount(split_bits(c, tensor.dtype, e, m)[0], minlength=1 << e) for c in chunks)
+        order = counts.argsort(descending=True, stable=True)
+        widths, exponent_bits = plan_levels(counts[order][:int((counts > 0).sum())].tolist(), e)
+        if best is None or n * (1 + m) + exponent_bits < best[0]:
+            best = (n * (1 + m) + exponent_bits, e, m, order, widths)
+    total_bits, e, m, order, widths = best
+    if not widths or total_bits > n * (1 + e + m) * (1 - MIN_SAVING):
         return None  # not worth encoding; checked again below on the real size, which includes padding
     rank = torch.empty(1 << e, dtype=torch.int32, device=device)
     rank[order] = torch.arange(1 << e, dtype=torch.int32, device=device)
@@ -149,7 +211,7 @@ def encode(tensor, chunk=None):
     escape = (1 << widths[0]) - 1
     level1, planes, extra, chunk_escapes, escaped_ranks, escaped_values = [], [[] for _ in range(rest_planes)], [], [], [], []
     for chunk in chunks:
-        exponent, rest = split_bits(chunk, tensor.dtype)
+        exponent, rest = split_bits(chunk, tensor.dtype, e, m)
         ranks = rank[exponent]
         codes = ranks.clamp(max=escape)
         escaped = codes == escape
@@ -193,6 +255,8 @@ def encode(tensor, chunk=None):
         "chunk_escapes": chunk_escapes,
         "sections": offsets,
     }
+    if tensor.dtype in SPLITS:
+        info["split"] = [e, m]
     blob = torch.cat(sections)
     if blob.numel() > tensor.numel() * tensor.element_size() * (1 - MIN_SAVING):
         return None
@@ -202,7 +266,7 @@ def encode(tensor, chunk=None):
 def decode(blob, info):
     """The exact original tensor, on the blob's device."""
     dtype = DTYPE_NAMES[info["dtype"]]
-    view, e, m = FORMATS[dtype]
+    view, e, m = layout(info)
     levels, counts, chunk = info["levels"], info["counts"], info["chunk"]
     sections = [blob[offset:offset + size] for offset, size in info["sections"]]
     n = counts[0]
@@ -234,6 +298,9 @@ def decode(blob, info):
             packed = rest_sections[rest_planes][begin // 8 * rest_extra:(begin + size + 7) // 8 * rest_extra]
             rest.append(unpack_bits(packed, rest_extra, size))
         _assemble(out_bytes[begin:begin + size], exponent, rest, e, m)
+        if dtype in FOLDED:  # the fold is its own inverse
+            values = out_bytes[begin:begin + size].view(-1)
+            values ^= torch.bitwise_right_shift(values, 7, out=exponent).mul_(0x7F)
     return out.view(dtype).view(info["shape"])
 
 

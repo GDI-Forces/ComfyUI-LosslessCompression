@@ -25,20 +25,28 @@ def bit_patterns(dtype):
     return torch.cat([torch.randint(-2**31, 2**31 - 1, (20000,), dtype=torch.int32), specials]).view(dtype)
 
 
+def weights(shape, dtype):
+    values = torch.randn(shape)
+    if dtype == torch.int8:
+        return (values * 30).round().clamp(-127, 127).to(torch.int8)
+    return (values * (50 if dtype == torch.float8_e4m3fn else 0.02)).to(dtype)
+
+
 def cases(dtype):
     patterns = bit_patterns(dtype)
-    mixed = torch.cat([(torch.randn(10 * patterns.numel()) * 0.02).to(dtype), patterns])
+    mixed = torch.cat([weights(10 * patterns.numel(), dtype), patterns])
     yield "every bit pattern", mixed[torch.randperm(mixed.numel())]
-    yield "weights", (torch.randn(700, 333) * (50 if dtype == torch.float8_e4m3fn else 0.02)).to(dtype)
-    yield "shorter than a block", (torch.randn(4100) * 0.02).to(dtype)
+    yield "weights", weights((700, 333), dtype)
+    yield "shorter than a block", weights(4100, dtype)
     # seven common exponents and some rare ones, with one 3-bit code level whose escapes go straight to raw
     exponents = torch.randint(0, 7, (20000,)).float()
     exponents[::500] = -3
-    yield "one level", (exponents.exp2() * (1 + 0.9 * torch.rand(20000)) * torch.randn(20000).sign()).to(dtype)
+    one_level = exponents.exp2() * (1 + 0.9 * torch.rand(20000)) * torch.randn(20000).sign()
+    yield "one level", one_level.round().clamp(-127, 127).to(dtype) if dtype == torch.int8 else one_level.to(dtype)
 
 
 def plan_one_level(counts, e):
-    return [3], 0
+    return [3], 0  # (int8 tries several splits; each gets this plan and the first is kept)
 
 
 torch.manual_seed(0)
