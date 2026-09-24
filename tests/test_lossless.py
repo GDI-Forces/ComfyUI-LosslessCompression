@@ -291,3 +291,37 @@ def test_kept_compressed_layer_moves_and_runs_exactly(device):
     assert isinstance(layer.weight, QuantizedTensor) and layer.weight.device.type == device
     x = torch.randn(4, 1024, dtype=torch.bfloat16, device=device)
     assert torch.equal(layer(x), torch.nn.functional.linear(x, weight.to(device), layer.bias))
+
+
+def test_safetensors_reader_matches_the_safetensors_library(tmp_path):
+    tensors = {
+        "bf16": torch.randn(3, 5).to(torch.bfloat16), "fp8": torch.randn(7).to(torch.float8_e4m3fn),
+        "f32": torch.randn(2, 2, 2), "i64": torch.arange(5), "mask": torch.tensor([True, False, True]),
+        "scalar": torch.tensor(2.5), "empty": torch.zeros(0, 4),
+    }
+    path = str(tmp_path / "all.safetensors")
+    safetensors.torch.save_file(tensors, path, metadata={"note": "x"})
+    with fileformat.SafetensorsFile(path) as f:
+        assert f.metadata == {"note": "x"}
+        read = {k: f.get(k) for k in f.keys()}
+    assert read.keys() == tensors.keys()
+    assert all(same_bits(read[k], tensors[k]) for k in tensors)
+
+
+def test_lossless_files_are_never_memory_mapped(tiny_diffusion_model, tiny_lora, tiny_vae, tmp_path, monkeypatch):
+    # On Windows, memory-mapping a big file fails when the paging file can't cover it
+    # ("The paging file is too small for this operation to complete. (os error 1455)").
+    def refuse(*args, **kwargs):
+        raise OSError("The paging file is too small for this operation to complete. (os error 1455)")
+    monkeypatch.setattr(safetensors, "safe_open", refuse)
+    model = compress_in_comfyui("diffusion_models", tiny_diffusion_model)
+    lora = compress_in_comfyui("loras", tiny_lora)
+    vae = compress_in_comfyui("vae", tiny_vae)
+
+    for keep_compressed in (False, True):
+        loaded = LoadDiffusionModelLossless.execute(model, keep_compressed).args[0]
+        assert LoadLoraLossless.execute(loaded, lora, 1.0, 1.0).args[0] is not None
+    assert LoadVAELossless.execute(vae).args[0] is not None
+    path = folder_paths.get_full_path("diffusion_models", model)
+    assert fileformat.verify(folder_paths.get_full_path("diffusion_models", tiny_diffusion_model), path) == []
+    fileformat.decompress_file(path, str(tmp_path / "restored.safetensors"))

@@ -23,7 +23,7 @@ They are under the **optimization** category in the node menu (the lossless ones
 1. Clone this repository into `ComfyUI/custom_nodes/`:
    ```
    cd ComfyUI/custom_nodes
-   git clone https://github.com/GDI-Forces/ComfyUI-LosslessCompression.git
+   git clone https://github.com/GDI-Forces/ComfyUINodeTest
    ```
 2. Restart ComfyUI.
 
@@ -158,10 +158,10 @@ Run it with the Python that runs ComfyUI. It works for `.safetensors`, `.ckpt`, 
 including VAEs and LoRAs, and uses the GPU when there is one:
 
 ```
-python custom_nodes/ComfyUI-LosslessCompression/lossless_compress.py compress models/diffusion_models/model.safetensors
-python custom_nodes/ComfyUI-LosslessCompression/lossless_compress.py info model.lossless.safetensors
-python custom_nodes/ComfyUI-LosslessCompression/lossless_compress.py verify model.safetensors model.lossless.safetensors
-python custom_nodes/ComfyUI-LosslessCompression/lossless_compress.py decompress model.lossless.safetensors -o model.safetensors
+python custom_nodes/ComfyUINodeTest/lossless_compress.py compress models/diffusion_models/model.safetensors
+python custom_nodes/ComfyUINodeTest/lossless_compress.py info model.lossless.safetensors
+python custom_nodes/ComfyUINodeTest/lossless_compress.py verify model.safetensors model.lossless.safetensors
+python custom_nodes/ComfyUINodeTest/lossless_compress.py decompress model.lossless.safetensors -o model.safetensors
 ```
 
 `compress` verifies its output unless you pass `--no-verify`. `decompress` gives back a regular `.safetensors`
@@ -183,7 +183,7 @@ file with the original tensors and metadata, so nothing is ever locked into this
 With ComfyUI running, export your workflow with **Workflow → Export (API)**, then run:
 
 ```
-python custom_nodes/ComfyUI-LosslessCompression/benchmark.py workflow_api.json
+python custom_nodes/ComfyUINodeTest/benchmark.py workflow_api.json
 ```
 
 Use `--url` if ComfyUI isn't on `http://127.0.0.1:8188` (the desktop app uses port 8000), and `--configs` to choose

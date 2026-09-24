@@ -89,7 +89,10 @@ def compress_model(model, dtype):
 
     The weights are rebuilt through the loader that made the model, the same way ComfyUI's
     own weight_dtype options load them, and the input model is left untouched."""
-    if model.model_dtype() in FP8_DTYPES or model.model.model_config.quant_config is not None:
+    if model.model.model_config.quant_config is not None:
+        logging.info("Compress Model: the model is already quantized (a ComfyUI mixed-precision file), leaving it as is.")
+        return model
+    if model.model_dtype() in FP8_DTYPES:
         logging.info(f"Compress Model: the model is already stored in {model.model_dtype()}, leaving it as is.")
         return model
     if model.get_wrappers(comfy.patcher_extension.WrappersMP.APPLY_MODEL, COMPILE_KEY):

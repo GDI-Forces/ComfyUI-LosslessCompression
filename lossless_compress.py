@@ -9,7 +9,7 @@ ComfyUI loads the result with this pack's "(Lossless)" loader nodes.
   python lossless_compress.py verify model.safetensors model.lossless.safetensors
   python lossless_compress.py info model.lossless.safetensors
 
-Run it with the Python that runs ComfyUI; it needs torch and safetensors.
+Run it with the Python that runs ComfyUI; it only needs torch.
 """
 import argparse
 import json
@@ -18,7 +18,6 @@ import os
 import sys
 import time
 
-import safetensors
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -67,22 +66,20 @@ def verify(args):
 
 
 def info(args):
-    dtypes = {name: dtype for dtype, name in fileformat.SAFETENSORS_DTYPES.items()}
     by_dtype = {}
-    with safetensors.safe_open(args.file, framework="pt") as f:
-        metadata = f.metadata()
-        if not fileformat.is_compressed(metadata):
+    with fileformat.SafetensorsFile(args.file) as f:
+        if not fileformat.is_compressed(f.metadata):
             sys.exit("Not a losslessly compressed file.")
-        infos = json.loads(metadata[fileformat.TENSORS_KEY])
-        for key in f.keys():
-            piece = f.get_slice(key)
-            stored = math.prod(piece.get_shape()) * dtypes[piece.get_dtype()].itemsize
+        infos = json.loads(f.metadata[fileformat.TENSORS_KEY])
+        for key, entry in f.header.items():
+            start, end = entry["data_offsets"]
+            stored = end - start
             name = key.removesuffix(fileformat.BLOB_SUFFIX)
             if name != key:
                 dtype = codec.DTYPE_NAMES[infos[name]["dtype"]]
                 original = math.prod(infos[name]["shape"]) * dtype.itemsize
             else:
-                dtype, original = dtypes[piece.get_dtype()], stored
+                dtype, original = fileformat.DTYPES[entry["dtype"]], stored
             before, after = by_dtype.get(dtype, (0, 0))
             by_dtype[dtype] = (before + original, after + stored)
     original = sum(before for before, _ in by_dtype.values())

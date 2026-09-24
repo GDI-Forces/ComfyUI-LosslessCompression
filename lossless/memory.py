@@ -11,7 +11,6 @@ weight every time it runs.
 import dataclasses
 import json
 
-import safetensors
 import torch
 
 import comfy.ops
@@ -119,15 +118,15 @@ class LosslessOps(comfy.ops.manual_cast):
 def load_keeping_compressed(path, prefix=""):
     """(state_dict, metadata) where the layer weights under `prefix` stay compressed, or None when the file can't
     be used that way: not compressed, or already quantized with ComfyUI's own formats, which need its quantized layers."""
-    with safetensors.safe_open(path, framework="pt") as f:
-        metadata = f.metadata()
-        keys = list(f.keys())
+    with fileformat.SafetensorsFile(path) as f:
+        metadata = f.metadata
+        keys = f.keys()
         if not fileformat.is_compressed(metadata) or any(k.endswith(("comfy_quant", "scale_weight", "scaled_fp8")) for k in keys):
             return None
         infos = json.loads(metadata[fileformat.TENSORS_KEY])
         state_dict = {}
         for key in keys:
-            tensor = f.get_tensor(key)
+            tensor = f.get(key)
             name = key.removesuffix(fileformat.BLOB_SUFFIX)
             if name == key:
                 state_dict[key] = tensor
