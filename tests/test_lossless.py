@@ -9,7 +9,8 @@ import folder_paths
 import nodes
 from conftest import sample
 from lossless import codec, fileformat
-from lossless.nodes import CompressModelFile, LoadCheckpointLossless, LoadCLIPLossless, LoadDiffusionModelLossless
+from lossless.nodes import (CompressModelFile, LoadCheckpointLossless, LoadCLIPLossless, LoadDiffusionModelLossless,
+                            LoadLoraLossless, LoadVAELossless)
 from optimizer_nodes import CompressModel, LoadCheckpointFP8
 
 
@@ -149,6 +150,46 @@ def test_lossless_text_encoder_encodes_exactly_like_the_original(tiny_text_encod
     (cond, pooled), (cond_original, pooled_original) = encode(loaded), encode(original)
     assert torch.isfinite(cond_original).all()
     assert torch.equal(cond, cond_original) and torch.equal(pooled, pooled_original)
+
+
+def encode_prompt(clip):
+    return clip.encode_from_tokens(clip.tokenize("a lighthouse at dusk"), return_pooled=True)[0]
+
+
+def test_lossless_lora_applies_exactly_like_the_original(tiny_diffusion_model, tiny_text_encoder, tiny_lora):
+    compressed = compress_in_comfyui("loras", tiny_lora)
+    assert json.loads(safetensors.safe_open(folder_paths.get_full_path("loras", compressed), "pt").metadata()[fileformat.TENSORS_KEY])
+    model = nodes.UNETLoader().load_unet(tiny_diffusion_model, "default")[0]
+    clip = nodes.CLIPLoader().load_clip(tiny_text_encoder, "stable_diffusion")[0]
+
+    model_original, clip_original = nodes.LoraLoader().load_lora(model, clip, tiny_lora, 0.8, 0.6)
+    model_lossless, clip_lossless = LoadLoraLossless.execute(model, compressed, 0.8, 0.6, clip=clip).args
+
+    assert torch.equal(sample(model_lossless, steps=3), sample(model_original, steps=3))
+    assert not torch.equal(sample(model_lossless, steps=3), sample(model, steps=3))
+    assert torch.equal(encode_prompt(clip_lossless), encode_prompt(clip_original))
+    assert not torch.equal(encode_prompt(clip_lossless), encode_prompt(clip))
+
+
+def test_lossless_lora_can_change_only_the_model(tiny_diffusion_model, tiny_lora):
+    compressed = compress_in_comfyui("loras", tiny_lora)
+    model = nodes.UNETLoader().load_unet(tiny_diffusion_model, "default")[0]
+    model_original = nodes.LoraLoaderModelOnly().load_lora_model_only(model, tiny_lora, 1.0)[0]
+    model_lossless, clip = LoadLoraLossless.execute(model, compressed, 1.0, 1.0).args
+    assert clip is None
+    assert torch.equal(sample(model_lossless, steps=3), sample(model_original, steps=3))
+
+
+def test_lossless_vae_decodes_exactly_like_the_original(tiny_vae):
+    compressed = compress_in_comfyui("vae", tiny_vae)
+    original = nodes.VAELoader().load_vae(tiny_vae)[0]
+    loaded = LoadVAELossless.execute(compressed).args[0]
+
+    latent = torch.randn(1, 4, 8, 8, generator=torch.Generator().manual_seed(0))
+    image = original.decode(latent)
+    assert torch.isfinite(image).all()
+    assert torch.equal(loaded.decode(latent), image)
+    assert loaded.patcher.cached_patcher_init is not None
 
 
 def test_lossless_models_can_be_compressed_to_fp8(tiny_diffusion_model):

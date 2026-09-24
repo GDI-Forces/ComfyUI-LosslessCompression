@@ -13,7 +13,8 @@ hooks, so its memory manager, LoRAs and other model patches keep working.
 | **Compact VRAM Before Load** | Right before a model loads onto the GPU, unloads the other models and clears cached memory so it gets the most free VRAM. |
 | **Free VRAM** | Passthrough node that unloads models and clears the GPU cache between stages of a workflow. |
 | **Compress Model File (Lossless)** | Writes a smaller copy of a model file whose weights decode to exactly the original bits. |
-| **Load Diffusion Model / Checkpoint / CLIP (Lossless)** | Load those files, optionally keeping the weights compressed in RAM and VRAM. |
+| **Load Diffusion Model / Checkpoint / CLIP (Lossless)** | Load those files; the diffusion model and checkpoint loaders can keep the weights compressed in RAM and VRAM. |
+| **Load LoRA / VAE (Lossless)** | Apply a compressed LoRA or load a compressed VAE, exactly like the regular nodes. |
 
 They are under the **optimization** category in the node menu (the lossless ones under **optimization/lossless**).
 
@@ -123,14 +124,23 @@ of the theoretical limit.
 
 ### In ComfyUI
 
-1. Add **Compress Model File (Lossless)**, pick a model from `diffusion_models`, `checkpoints` or
-   `text_encoders`, and queue it. It writes `<name>.lossless.safetensors` next to the original, checks that
+1. Add **Compress Model File (Lossless)**, pick a file from `diffusion_models`, `checkpoints`,
+   `text_encoders`, `loras` or `vae`, and queue it. It writes `<name>.lossless.safetensors` next to the original, checks that
    every tensor decodes to exactly the original bits, and shows the saving. The original is never touched;
    delete it yourself once you're happy.
-2. Press **R** to refresh, then load the new file with **Load Diffusion Model (Lossless)**, **Load Checkpoint
-   (Lossless)** or **Load CLIP (Lossless)** in place of the regular loader.
+2. Press **R** to refresh, then use the new file with the matching lossless node in place of the regular one:
 
-The loaders have a `keep_compressed` option:
+   | File in | Regular node | Lossless node |
+   | --- | --- | --- |
+   | `diffusion_models` | Load Diffusion Model | **Load Diffusion Model (Lossless)** |
+   | `checkpoints` | Load Checkpoint | **Load Checkpoint (Lossless)** |
+   | `text_encoders` | Load CLIP | **Load CLIP (Lossless)** |
+   | `loras` | Load LoRA / LoraLoaderModelOnly | **Load LoRA (Lossless)**; leave `clip` unconnected to change only the model |
+   | `vae` | Load VAE | **Load VAE (Lossless)** |
+
+   The results are identical to the regular nodes with the original file.
+
+The diffusion model and checkpoint loaders have a `keep_compressed` option:
 
 - **Off (default):** the weights are decoded once while loading. Generation is exactly as fast as with the
   original file; only disk space (and download size) is saved. Decoding runs on the GPU when there is one.
@@ -156,6 +166,16 @@ python custom_nodes/ComfyUINodeTest/lossless_compress.py decompress model.lossle
 
 `compress` verifies its output unless you pass `--no-verify`. `decompress` gives back a regular `.safetensors`
 file with the original tensors and metadata, so nothing is ever locked into this format.
+
+### Limits
+
+- LoRAs, VAEs and text encoders are always decoded when loaded: they only save disk space. They are usually
+  small next to the diffusion model, and LoRA weights are folded into the model's weights anyway.
+- With `keep_compressed` off, a decoded model sits in RAM like a model loaded from a `.ckpt` file. ComfyUI can't
+  page it back to disk the way it does with memory-mapped `.safetensors` files, so on a machine with little RAM
+  the original file may load more comfortably.
+- Speeds were only measured on a 4-thread CPU here (about 65 MB/s to compress and 180 MB/s to decode bf16).
+  GPU speed and the per-step cost of `keep_compressed` haven't been measured yet.
 
 ## Measuring the speed-up on your GPU
 

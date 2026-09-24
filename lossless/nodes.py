@@ -18,7 +18,7 @@ from comfy_api.latest import io, ui
 from . import fileformat, memory
 
 CATEGORY = "optimization/lossless"
-COMPRESSIBLE_FOLDERS = ["diffusion_models", "checkpoints", "text_encoders"]
+COMPRESSIBLE_FOLDERS = ["diffusion_models", "checkpoints", "text_encoders", "loras", "vae"]
 MARKER = ".lossless."
 
 
@@ -95,6 +95,18 @@ def load_text_encoder_patcher(paths, embedding_directory=None, clip_type=comfy.s
     return load_text_encoder(paths, embedding_directory, clip_type, model_options, disable_dynamic).patcher
 
 
+def load_vae(path, device=None):
+    state_dict, metadata = load_state_dict(path)
+    vae = comfy.sd.VAE(sd=state_dict, metadata=metadata, device=device)
+    vae.throw_exception_if_invalid()
+    vae.patcher.cached_patcher_init = (load_vae_patcher, (path, device))
+    return vae
+
+
+def load_vae_patcher(path, device=None, disable_dynamic=False):
+    return load_vae(path, device).patcher
+
+
 class LoadDiffusionModelLossless(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -169,6 +181,50 @@ class LoadCLIPLossless(io.ComfyNode):
         return io.NodeOutput(load_text_encoder([path], folder_paths.get_folder_paths("embeddings"), clip_type))
 
 
+class LoadLoraLossless(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="LosslessLoadLora",
+            display_name="Load LoRA (Lossless)",
+            category=CATEGORY,
+            description="Applies a LoRA made by Compress Model File (Lossless), with exactly the original weights. "
+                        "Works like the regular Load LoRA node; leave clip unconnected to change only the model.",
+            inputs=[
+                io.Model.Input("model"),
+                io.Clip.Input("clip", optional=True),
+                io.Combo.Input("lora_name", options=compressed_files("loras")),
+                io.Float.Input("strength_model", default=1.0, min=-100.0, max=100.0, step=0.01),
+                io.Float.Input("strength_clip", default=1.0, min=-100.0, max=100.0, step=0.01),
+            ],
+            outputs=[io.Model.Output(), io.Clip.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model, lora_name, strength_model, strength_clip, clip=None) -> io.NodeOutput:
+        if strength_model == 0 and (clip is None or strength_clip == 0):
+            return io.NodeOutput(model, clip)
+        lora, metadata = load_state_dict(folder_paths.get_full_path_or_raise("loras", lora_name))
+        return io.NodeOutput(*comfy.sd.load_lora_for_models(model, clip, lora, strength_model, strength_clip, lora_metadata=metadata))
+
+
+class LoadVAELossless(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="LosslessLoadVAE",
+            display_name="Load VAE (Lossless)",
+            category=CATEGORY,
+            description="Loads a VAE made by Compress Model File (Lossless), with exactly the original weights.",
+            inputs=[io.Combo.Input("vae_name", options=compressed_files("vae"))],
+            outputs=[io.Vae.Output()],
+        )
+
+    @classmethod
+    def execute(cls, vae_name) -> io.NodeOutput:
+        return io.NodeOutput(load_vae(folder_paths.get_full_path_or_raise("vae", vae_name)))
+
+
 class CompressModelFile(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -210,4 +266,4 @@ class CompressModelFile(io.ComfyNode):
         return io.NodeOutput(ui=ui.PreviewText(text))
 
 
-NODES = [CompressModelFile, LoadDiffusionModelLossless, LoadCheckpointLossless, LoadCLIPLossless]
+NODES = [CompressModelFile, LoadDiffusionModelLossless, LoadCheckpointLossless, LoadCLIPLossless, LoadLoraLossless, LoadVAELossless]

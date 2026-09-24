@@ -52,7 +52,8 @@ def test_pack_loads_as_a_custom_node():
     assert asyncio.run(nodes.load_custom_node(REPO_ROOT))
     for node_id in ["OptimizerSpeedUpModel", "OptimizerLoadCheckpointFP8", "OptimizerCompressModel",
                     "OptimizerCompactVRAM", "OptimizerFreeVRAM", "LosslessCompressModelFile",
-                    "LosslessLoadDiffusionModel", "LosslessLoadCheckpoint", "LosslessLoadCLIP"]:
+                    "LosslessLoadDiffusionModel", "LosslessLoadCheckpoint", "LosslessLoadCLIP", "LosslessLoadLora",
+                    "LosslessLoadVAE"]:
         info = nodes.NODE_CLASS_MAPPINGS[node_id].GET_NODE_INFO_V1()
         assert info["category"].startswith("optimization")
 

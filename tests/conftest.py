@@ -85,6 +85,42 @@ def tiny_text_encoder(tmp_path_factory):
     return "tiny_clip_l.safetensors"
 
 
+@pytest.fixture(scope="session")
+def tiny_lora(tmp_path_factory):
+    """A bf16 rank-16 LoRA (kohya key names) for two attention layers of the tiny UNet and one of CLIP-L."""
+    torch.manual_seed(0)
+    layers = {  # LoRA name: (out features, in features)
+        "lora_unet_input_blocks_1_1_transformer_blocks_0_attn1_to_q": (320, 320),
+        "lora_unet_input_blocks_1_1_transformer_blocks_0_attn2_to_k": (320, 768),
+        "lora_te_text_model_encoder_layers_0_self_attn_q_proj": (768, 768),
+    }
+    lora = {}
+    for name, (out_features, in_features) in layers.items():
+        lora[f"{name}.lora_up.weight"] = (torch.randn(out_features, 16) * 0.05).to(torch.bfloat16)
+        lora[f"{name}.lora_down.weight"] = (torch.randn(16, in_features) * 0.05).to(torch.bfloat16)
+        lora[f"{name}.alpha"] = torch.tensor(16.0)
+    folder = tmp_path_factory.mktemp("loras")
+    comfy.utils.save_torch_file(lora, str(folder / "tiny_lora.safetensors"), metadata={"ss_network_dim": "16"})
+    folder_paths.add_model_folder_path("loras", str(folder))
+    return "tiny_lora.safetensors"
+
+
+@pytest.fixture(scope="session")
+def tiny_vae(tmp_path_factory):
+    """A bf16 VAE in the SD1.x format, with random weights."""
+    from comfy.ldm.models.autoencoder import AutoencoderKL
+    torch.manual_seed(0)
+    ddconfig = {"double_z": True, "z_channels": 4, "resolution": 256, "in_channels": 3, "out_ch": 3, "ch": 128,
+                "ch_mult": [1, 2, 4, 4], "num_res_blocks": 2, "attn_resolutions": [], "dropout": 0.0}
+    vae = AutoencoderKL(ddconfig=ddconfig, embed_dim=4)
+    for p in vae.parameters():  # ComfyUI leaves weights uninitialized
+        torch.nn.init.normal_(p, std=0.02)
+    folder = tmp_path_factory.mktemp("vae")
+    comfy.utils.save_torch_file({k: v.to(torch.bfloat16) for k, v in vae.state_dict().items()}, str(folder / "tiny_vae.safetensors"))
+    folder_paths.add_model_folder_path("vae", str(folder))
+    return "tiny_vae.safetensors"
+
+
 def sample(model, steps=8, seed=0):
     latent = torch.zeros(1, 4, 8, 8)
     noise = comfy.sample.prepare_noise(latent, seed)
