@@ -3,6 +3,7 @@
 Point COMFYUI_PATH at a ComfyUI folder and run pytest from a Python environment
 that has ComfyUI's requirements installed.
 """
+import json
 import os
 import sys
 
@@ -68,6 +69,27 @@ def tiny_diffusion_model(tmp_path_factory, tiny_unet_weights):
     comfy.utils.save_torch_file(dict(tiny_unet_weights), str(folder / "tiny_sd15_unet.safetensors"))
     folder_paths.add_model_folder_path("diffusion_models", str(folder))
     return "tiny_sd15_unet.safetensors"
+
+
+@pytest.fixture(scope="session")
+def tiny_fp8_quantized_model(tmp_path_factory, tiny_unet_weights):
+    """The tiny UNet as a ComfyUI pre-quantized file: every 2-D (linear) weight stored as fp8 with a per-tensor
+    scale and a comfy_quant marker, the format of ComfyUI's own "mixed precision" fp8 releases."""
+    marker = torch.tensor(list(json.dumps({"format": "float8_e4m3fn"}).encode()), dtype=torch.uint8)
+    state_dict = {}
+    for key, weight in tiny_unet_weights.items():
+        if key.endswith(".weight") and weight.ndim == 2:
+            layer = key[:-len(".weight")]
+            scale = weight.abs().amax().float() / torch.finfo(torch.float8_e4m3fn).max
+            state_dict[key] = (weight / scale).to(torch.float8_e4m3fn)
+            state_dict[f"{layer}.weight_scale"] = scale
+            state_dict[f"{layer}.comfy_quant"] = marker.clone()
+        else:
+            state_dict[key] = weight
+    folder = tmp_path_factory.mktemp("diffusion_models_fp8")
+    comfy.utils.save_torch_file(state_dict, str(folder / "tiny_sd15_fp8_mixed.safetensors"))
+    folder_paths.add_model_folder_path("diffusion_models", str(folder))
+    return "tiny_sd15_fp8_mixed.safetensors"
 
 
 @pytest.fixture(scope="session")

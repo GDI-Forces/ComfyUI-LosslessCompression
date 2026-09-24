@@ -15,6 +15,7 @@ hooks, so its memory manager, LoRAs and other model patches keep working.
 | **Compress Model File (Lossless)** | Writes a smaller copy of a model file whose weights decode to exactly the original bits. |
 | **Load Diffusion Model / Checkpoint / CLIP (Lossless)** | Load those files; the diffusion model and checkpoint loaders can keep the weights compressed in RAM and VRAM. |
 | **Load LoRA / VAE (Lossless)** | Apply a compressed LoRA or load a compressed VAE, exactly like the regular nodes. |
+| **Keep Model Compressed (Lossless VRAM)** | Keeps any loaded model's weights losslessly compressed in RAM and VRAM: less VRAM, identical results, slower steps. |
 
 They are under the **optimization** category in the node menu (the lossless ones under **optimization/lossless**).
 
@@ -113,7 +114,7 @@ How much it saves, measured on 25M real trained parameters (every tensor verifie
 | Stored as | Saving | Theoretical limit |
 | --- | --- | --- |
 | bf16 | **31%** | 32% |
-| fp8 e5m2 / e4m3fn | 25% / 22% | 27% / 24% |
+| fp8 e5m2 / e4m3fn | 25% / 22% (13% for e4m3fn files scaled per tensor) | 27% / 24% (16%) |
 | fp32 | 16% | 16% |
 | fp16 | 13% | 13% |
 
@@ -140,17 +141,54 @@ of the theoretical limit.
 
    The results are identical to the regular nodes with the original file.
 
-The diffusion model and checkpoint loaders have a `keep_compressed` option:
+### Using less VRAM
 
-- **Off (default):** the weights are decoded once while loading. Generation is exactly as fast as with the
-  original file; only disk space (and download size) is saved. Decoding runs on the GPU when there is one.
-- **On (experimental):** the weights stay compressed in RAM and VRAM, and each layer is decoded when it runs,
-  so the model takes about as much memory as the file (for bf16, ~31% less VRAM and RAM). Every step gets
-  slower because of the decoding; the cost is smaller for big video models, where each step does a lot of
-  work per weight, than for small image models. LoRAs work and stay compressed. Models loaded this way use
-  ComfyUI's classic memory manager rather than DynamicVRAM, can't also go through Compress Model (FP8), and
-  haven't been tried with `torch.compile`. Files that were already quantized (fp8 "scaled" or other ComfyUI
-  quantized formats) are loaded decoded.
+On their own, compressed files only save disk space, because the loaders decode the weights while loading.
+To save VRAM as well, keep the weights compressed in memory, in either of two ways:
+
+- Put **Keep Model Compressed (Lossless VRAM)** right after any model loader (and after your LoRAs). It works
+  with regular model files too, so no `.lossless` file is needed.
+- Or turn on `keep_compressed` in **Load Diffusion Model (Lossless)** or **Load Checkpoint (Lossless)**.
+
+Each layer's weight then stays compressed in RAM and VRAM and is decoded just before the layer runs, so the
+results stay exactly the same. How much less memory the weights take:
+
+| Weights stored as | Less VRAM for the weights |
+| --- | --- |
+| bf16 | ~31% |
+| fp8 e5m2, or fp8 from a loader's `weight_dtype` / Compress Model (FP8) | ~22–26% |
+| fp32 | ~16% |
+| fp16 | ~13% |
+| ComfyUI's pre-quantized fp8 e4m3fn files (scaled per tensor) | ~13% |
+| int8 or 4-bit (nvfp4 and similar) layers | none; they are left as they are, since their data doesn't compress |
+
+The console reports what it did, e.g.
+`Keep Model Compressed: 312 layer weights kept compressed, 12.10 GB -> 10.52 GB (13.1% less memory)`.
+Pre-quantized fp8 files save less because their scaling spreads the weights over the whole fp8 range; the
+theoretical limit for them is about 16%.
+
+Things to know:
+
+- Every step gets slower, because each layer is decoded every time it runs. fp8 layers decode straight back into
+  ComfyUI's fp8 format and then use its normal fp8 kernels. If the smaller model now fits entirely on your GPU
+  where it didn't before, avoiding the constant swapping of weights may make up for it.
+- **Install Triton for speed.** With Triton, each weight is decoded by one GPU kernel that reads the compressed
+  bytes once and writes the weight once. Without it, a PyTorch decoder runs a few dozen small GPU operations per
+  weight instead. On Windows install `triton-windows` in ComfyUI's Python, in the version that matches your
+  PyTorch (for PyTorch 2.8: `python_embeded\python.exe -m pip install "triton-windows<3.5"`). The portable build's
+  embedded Python also needs the `include` and `libs` folders described in the triton-windows instructions. The
+  console says `Lossless: decoding compressed weights with Triton.` once the kernel is in use; otherwise it
+  suggests installing Triton. The kernel checks its first result for each weight format against the PyTorch
+  decoder, and if they ever differ, or Triton fails to compile, it switches itself off and logs why.
+- Decoding needs some VRAM next to the model: room for the decoded layer, plus a few bytes per value for the
+  PyTorch decoder. These models tell ComfyUI how much, so it keeps that much free when it decides how much of
+  the model to load. (Earlier versions didn't, and their decoder needed several times more temporary memory.
+  On a nearly full GPU that can go over the limit, and on Windows the driver then moves the overflow to shared
+  GPU memory in system RAM: the likely cause of generations getting slower one after another.)
+- These models use ComfyUI's classic memory manager rather than DynamicVRAM.
+- To combine it with **Compress Model (FP8)**, put that node first. It hasn't been tried with `torch.compile`.
+- Task Manager's VRAM figure includes memory ComfyUI keeps cached, so it can look unchanged. The console's
+  "loaded completely/partially … MB" line shows how much the model really takes.
 
 ### Command line
 
@@ -174,8 +212,9 @@ file with the original tensors and metadata, so nothing is ever locked into this
 - With `keep_compressed` off, a decoded model sits in RAM like a model loaded from a `.ckpt` file. ComfyUI can't
   page it back to disk the way it does with memory-mapped `.safetensors` files, so on a machine with little RAM
   the original file may load more comfortably.
-- Speeds were only measured on a 4-thread CPU here (about 65 MB/s to compress and 180 MB/s to decode bf16).
-  GPU speed and the per-step cost of `keep_compressed` haven't been measured yet.
+- Speeds were only measured on a 4-thread CPU here (about 70 MB/s to compress and 110-350 MB/s to decode, depending on the format).
+  The Triton kernel is checked bit for bit in Triton's CPU interpreter, but GPU speed and the per-step cost of
+  keeping weights compressed haven't been measured yet.
 
 ## Measuring the speed-up on your GPU
 
@@ -207,6 +246,9 @@ weights, so no downloads are needed. Tests marked for CUDA are skipped on machin
 pip install pytest   # in an environment with ComfyUI's requirements installed
 COMFYUI_PATH=/path/to/ComfyUI python -m pytest tests
 ```
+
+Without a GPU, the Triton decoder's test runs the kernel in Triton's CPU interpreter (it needs the `triton`
+package). `python tests/triton_check.py` runs the same check on its own.
 
 On that test model, fp8 loading cut the diffusion model from 139.8 MiB (fp32) to 35.0 MiB, and
 `step_cache` 0.1–0.5 skipped 5–6 of 12 model passes. Real models and GPUs will differ.

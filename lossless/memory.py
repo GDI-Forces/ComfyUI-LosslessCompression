@@ -1,94 +1,135 @@
-"""Keeps losslessly compressed weights compressed in RAM and VRAM.
+"""Keeps a loaded model's weights losslessly compressed in RAM and VRAM.
 
-Each compressed layer weight becomes a comfy_kitchen QuantizedTensor with a
+Each layer weight is replaced by a comfy_kitchen QuantizedTensor with a
 "LosslessLayout" whose dequantize is the exact decoder. ComfyUI's layers already
-handle QuantizedTensor weights when moving and casting them (as they do for
-fp8 and fp4 checkpoints), and any operation without a special path decodes the
-weight first, so the model computes with exactly the original weights while
-only the compressed bytes stay resident. The price is decoding each layer's
-weight every time it runs.
+handle QuantizedTensor weights when moving and casting them (as they do for its
+fp8 and fp4 files), and any operation without a special path decodes the weight
+first, so the model computes with exactly its original weights while only the
+compressed bytes stay resident. The price is decoding each layer's weight every
+time it runs.
+
+Plain weights in any float format (fp32, fp16, bf16, fp8) are compressed as they
+are. Layers of ComfyUI's pre-quantized fp8 files keep their fp8 data compressed
+and get their own quantized tensor back right before their fp8 kernel runs.
+Other quantized formats (int8, 4-bit) are left alone: their data doesn't compress.
+
+On the GPU the weights are decoded by a Triton kernel when Triton is installed
+(kernels.py), otherwise by the PyTorch decoder. Either way decoding needs some
+memory next to the model. That is added to ComfyUI's estimate of what sampling
+needs, so ComfyUI keeps it free instead of the GPU running out mid-step.
 """
 import dataclasses
-import json
 
 import torch
 
 import comfy.ops
-from comfy.quant_ops import QuantizedLayout, QuantizedTensor, register_layout_class
+from comfy.quant_ops import QuantizedLayout, QuantizedTensor, get_layout_class, register_layout_class
 from comfy_kitchen.tensor.base import BaseLayoutParams
 
-from . import codec, fileformat
+from . import codec, kernels
 
 LAYOUT = "LosslessLayout"
+MIN_ELEMENTS = 4096
+INNER_PARAMS = {"scale", "orig_dtype", "orig_shape"}  # quantized layouts whose data can be wrapped (fp8)
+CHUNK = 1 << 23  # values the PyTorch decoder handles at a time; bounds its temporary memory
 
 
 @dataclasses.dataclass(frozen=True)
 class LosslessParams(BaseLayoutParams):
-    info: dict = None
+    info: dict = None   # how to decode the data
+    inner: str = None   # the ComfyUI quantized layout the data belongs to, or None for a plain weight
 
 
 class LosslessLayout(QuantizedLayout):
     Params = LosslessParams
 
     @classmethod
-    def quantize(cls, tensor, **kwargs):
-        # Used when a LoRA is baked into a weight; a weight that no longer compresses is kept raw.
-        encoded = codec.encode(tensor)
-        blob, info = encoded if encoded is not None else (tensor.contiguous().reshape(-1).view(torch.uint8), None)
-        return blob, LosslessParams(
-            scale=torch.ones((), device=tensor.device), orig_dtype=tensor.dtype, orig_shape=tuple(tensor.shape), info=info)
+    def quantize(cls, tensor, inner=None, **kwargs):
+        # Used when ComfyUI bakes a LoRA into a weight.
+        if inner is None:
+            return pack(tensor, torch.ones((), device=tensor.device), tensor.dtype, tuple(tensor.shape), None)
+        quantized = QuantizedTensor.from_float(tensor, inner, **kwargs)
+        params = quantized._params
+        return pack(quantized._qdata, params.scale, params.orig_dtype, params.orig_shape, inner)
 
     @classmethod
     def dequantize(cls, qdata, params):
-        if params.info is None:
-            return qdata.view(params.orig_dtype).view(params.orig_shape)
-        return codec.decode(qdata, params.info).to(params.orig_dtype)
+        data = decode(qdata, params.info)
+        if params.inner is not None:
+            return inner_tensor(data, params).dequantize()
+        return data.to(params.orig_dtype)
+
+    @classmethod
+    def requantize_kwargs(cls, qtensor):
+        return {"inner": qtensor._params.inner}
 
     @classmethod
     def get_plain_tensors(cls, qtensor):
-        return (qtensor._qdata,)
+        return qtensor._qdata, qtensor._params.scale
 
     @classmethod
     def state_dict_tensors(cls, qdata, params):
-        return {"": qdata}
+        # What ComfyUI's quantized layers put in state_dict(): a weight with the right shape and dtype (the fp8 data
+        # for fp8 layers, next to its scale) that still only takes the compressed bytes.
+        if params.inner is None:
+            return {"": QuantizedTensor(qdata, LAYOUT, params)}
+        data_dtype = codec.DTYPE_NAMES[params.info.get("raw", params.info.get("dtype"))]
+        data = dataclasses.replace(params, scale=torch.ones((), device=qdata.device), orig_dtype=data_dtype, inner=None)
+        return {"": QuantizedTensor(qdata, LAYOUT, data), "_scale": params.scale}
 
 
 register_layout_class(LAYOUT, LosslessLayout)
 
 
-def compressed_tensor(blob, info):
-    dtype = codec.DTYPE_NAMES[info["dtype"]]
-    params = LosslessParams(scale=torch.ones(()), orig_dtype=dtype, orig_shape=tuple(info["shape"]), info=info)
-    return QuantizedTensor(blob, LAYOUT, params)
+def pack(data, scale, orig_dtype, orig_shape, inner, compress_on=None):
+    """(blob, params) for `data`; data that doesn't compress is kept as raw bytes."""
+    encoded = codec.encode(data.to(compress_on) if compress_on else data, chunk=CHUNK)
+    if encoded is None:
+        blob, info = data.contiguous().reshape(-1).view(torch.uint8), {"raw": str(data.dtype).removeprefix("torch."), "shape": list(data.shape)}
+    else:
+        blob, info = encoded
+        if kernels.installed():
+            blob, info = kernels.attach(blob, info)
+        blob = blob.to(data.device)
+    return blob, LosslessParams(scale=scale, orig_dtype=orig_dtype, orig_shape=tuple(orig_shape), info=info, inner=inner)
 
 
-class CompressedWeight:
-    """Mixin for ComfyUI layers: adopts a compressed weight from the state dict as is, and keeps it
-    compressed when the layer moves between devices."""
+@torch.compiler.disable  # plain eager code; torch.compile would recompile it for every layer
+def decode(qdata, info):
+    if "raw" in info:
+        return qdata.view(codec.DTYPE_NAMES[info["raw"]]).view(info["shape"])
+    if "tables" in info and kernels.usable(qdata.device):
+        decoded = kernels.decode(qdata, info)
+        if decoded is not None:
+            return decoded
+    return codec.decode(qdata, info)
 
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-        key = prefix + "weight"
-        weight = state_dict.get(key)
-        if isinstance(weight, QuantizedTensor):
-            del state_dict[key]
-            self.weight = torch.nn.Parameter(weight, requires_grad=False)
-        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
-        if isinstance(weight, QuantizedTensor) and key in missing_keys:
-            missing_keys.remove(key)
 
-    # ComfyUI hands LoRA patching the decoded weight (convert) and gives the result back (set).
+def inner_tensor(data, params):
+    layout = get_layout_class(params.inner)
+    return QuantizedTensor(data, params.inner, layout.Params(scale=params.scale, orig_dtype=params.orig_dtype, orig_shape=params.orig_shape))
+
+
+def is_compressed(weight):
+    return isinstance(weight, QuantizedTensor) and weight._layout_cls == LAYOUT
+
+
+# A compressed layer becomes an instance of a subclass of its class with one of these mixed in. (Methods stored on
+# the layer itself would reference the layer from itself, and such a model is only freed by a full garbage collect.)
+
+class PlainLayer:
+    """For layers with a compressed plain weight: the hooks ComfyUI's quantized layers have. LoRA patching gets
+    the decoded weight (convert) and hands the result back (set), and .to() goes through the tensor subclass."""
+
     def convert_weight(self, weight, inplace=False, **kwargs):
         return weight.dequantize() if isinstance(weight, QuantizedTensor) else weight
 
     def set_weight(self, weight, inplace_update=False, seed=None, return_weight=False, **kwargs):
         if return_weight:  # patched on the fly for one forward pass: no point re-encoding it
             return weight.to(self.weight.dtype)
-        if isinstance(self.weight, QuantizedTensor):
-            weight = QuantizedTensor.from_float(weight.to(self.weight.dtype), LAYOUT)
-        self.weight = torch.nn.Parameter(weight, requires_grad=False)
+        self.weight = torch.nn.Parameter(QuantizedTensor.from_float(weight.to(self.weight.dtype), LAYOUT), requires_grad=False)
 
     def _apply(self, fn, recurse=True):
-        # Same as ComfyUI's quantized layers: re-wrap parameters so .to() goes through the tensor subclass.
         if recurse:
             for child in self.children():
                 child._apply(fn)
@@ -101,37 +142,97 @@ class CompressedWeight:
         return self
 
 
-class LosslessOps(comfy.ops.manual_cast):
-    class Linear(CompressedWeight, comfy.ops.manual_cast.Linear):
-        pass
+class QuantizedLayer:
+    """For ComfyUI fp8 layers whose fp8 data is compressed."""
 
-    class Conv1d(CompressedWeight, comfy.ops.manual_cast.Conv1d):
-        pass
+    def _forward(self, input, weight, bias):
+        # The fp8 kernel gets the layer's own quantized weight back.
+        if is_compressed(weight) and weight._params.inner is not None:
+            weight = inner_tensor(decode(weight._qdata, weight._params.info), weight._params)
+        return super()._forward(input, weight, bias)
 
-    class Conv2d(CompressedWeight, comfy.ops.manual_cast.Conv2d):
-        pass
+    def set_weight(self, weight, inplace_update=False, seed=None, return_weight=False, **kwargs):
+        current = self.weight
+        if return_weight and is_compressed(current) and current._params.inner is not None:
+            # A LoRA applied on the fly to an offloaded layer, for one forward pass: quantize the result the way
+            # ComfyUI does (requantize_from_float of the fp8 weight), but don't compress it only to decode it again.
+            quantized = QuantizedTensor.from_float(weight, current._params.inner, scale="recalculate",
+                                                   stochastic_rounding=seed, inplace_ops=True)
+            return quantized.to(current.dtype)
+        return super().set_weight(weight, inplace_update=inplace_update, seed=seed, return_weight=return_weight, **kwargs)
 
-    class Conv3d(CompressedWeight, comfy.ops.manual_cast.Conv3d):
-        pass
+
+def compressed_class(cls, hooks):
+    """cls with the hooks mixed in, made once per class and kept on it."""
+    attribute = f"_lossless_{hooks.__name__}"
+    subclass = cls.__dict__.get(attribute)
+    if subclass is None:
+        subclass = type(cls.__name__, (hooks, cls), {"__module__": cls.__module__, "__qualname__": cls.__qualname__})
+        setattr(cls, attribute, subclass)
+    return subclass
 
 
-def load_keeping_compressed(path, prefix=""):
-    """(state_dict, metadata) where the layer weights under `prefix` stay compressed, or None when the file can't
-    be used that way: not compressed, or already quantized with ComfyUI's own formats, which need its quantized layers."""
-    with fileformat.SafetensorsFile(path) as f:
-        metadata = f.metadata
-        keys = f.keys()
-        if not fileformat.is_compressed(metadata) or any(k.endswith(("comfy_quant", "scale_weight", "scaled_fp8")) for k in keys):
+def compress_module(module, compress_on=None):
+    """Replaces a ComfyUI layer's weight with a compressed copy, in place. Returns (bytes before, bytes after),
+    or None when the layer is left alone (not a ComfyUI layer, too small, int8/4-bit, or doesn't compress)."""
+    weight = getattr(module, "weight", None)
+    if not isinstance(module, comfy.ops.CastWeightBiasOp) or not isinstance(weight, torch.Tensor) or weight.numel() < MIN_ELEMENTS:
+        return None
+    if isinstance(weight, QuantizedTensor):
+        params = weight._params
+        if (weight._qdata.dtype not in codec.FORMATS or not hasattr(module, "_forward")
+                or {f.name for f in dataclasses.fields(params)} != INNER_PARAMS):
             return None
-        infos = json.loads(metadata[fileformat.TENSORS_KEY])
-        state_dict = {}
-        for key in keys:
-            tensor = f.get(key)
-            name = key.removesuffix(fileformat.BLOB_SUFFIX)
-            if name == key:
-                state_dict[key] = tensor
-            elif name.startswith(prefix) and name.endswith(".weight") and len(infos[name]["shape"]) >= 2:
-                state_dict[name] = compressed_tensor(tensor, infos[name])
-            else:
-                state_dict[name] = codec.decode(tensor, infos[name])
-    return state_dict, json.loads(metadata[fileformat.METADATA_KEY]) or None
+        data = weight._qdata
+        blob, new_params = pack(data, params.scale, params.orig_dtype, params.orig_shape, weight._layout_cls, compress_on)
+    elif weight.dtype in codec.FORMATS and weight.ndim >= 2:
+        data = weight
+        blob, new_params = pack(data, torch.ones((), device=weight.device), weight.dtype, weight.shape, None, compress_on)
+    else:
+        return None
+    if "raw" in new_params.info:
+        return None
+
+    module.__class__ = compressed_class(type(module), PlainLayer if new_params.inner is None else QuantizedLayer)
+    module.weight = torch.nn.Parameter(QuantizedTensor(blob, LAYOUT, new_params), requires_grad=False)
+    return data.nbytes, blob.nbytes
+
+
+def decode_memory(info, triton=False):
+    """Memory that decoding a weight takes besides its compressed bytes: the decoded weight, plus the PyTorch
+    decoder's temporaries unless the Triton kernel does the work."""
+    decoded = info["counts"][0] * codec.DTYPE_NAMES[info["dtype"]].itemsize
+    return decoded if triton else decoded + codec.temporary_memory(info)
+
+
+def keep_compressed(model, compress_on=None):
+    """Compresses the diffusion model's layer weights in place and returns (bytes before, bytes after, layers).
+    `compress_on` is the device to encode on (the GPU is much faster). Also records how much memory decoding
+    needs, for reserve_decode_memory."""
+    before = after = layers = workspace = 0
+    triton = compress_on is not None and kernels.usable(torch.device(compress_on))
+    for module in model.model.diffusion_model.modules():
+        sizes = compress_module(module, compress_on)
+        if sizes is not None:
+            before, after, layers = before + sizes[0], after + sizes[1], layers + 1
+            workspace = max(workspace, decode_memory(module.weight._params.info, triton))
+    model.size = 0  # ComfyUI recomputes it from the compressed weights
+    model.model.lossless_decode_memory = workspace
+    return before, after, layers
+
+
+def reserve_decode_memory(executor, model, noise_shape, conds, *args, **kwargs):
+    """PREPARE_SAMPLING wrapper: adds the memory decoding needs to ComfyUI's estimate of what sampling needs, so
+    ComfyUI leaves that much VRAM free when it decides how much of the model to load. Without it, decoding can push
+    a full GPU over its limit; on Windows the driver then moves memory to shared system RAM, and every following
+    step and generation gets slower."""
+    base = model.model
+    extra = getattr(base, "lossless_decode_memory", 0)
+    if not extra:
+        return executor(model, noise_shape, conds, *args, **kwargs)
+    estimate = base.memory_required
+    base.memory_required = lambda *a, **k: estimate(*a, **k) + extra
+    try:
+        return executor(model, noise_shape, conds, *args, **kwargs)
+    finally:
+        del base.memory_required

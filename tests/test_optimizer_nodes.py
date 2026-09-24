@@ -53,7 +53,7 @@ def test_pack_loads_as_a_custom_node():
     for node_id in ["OptimizerSpeedUpModel", "OptimizerLoadCheckpointFP8", "OptimizerCompressModel",
                     "OptimizerCompactVRAM", "OptimizerFreeVRAM", "LosslessCompressModelFile",
                     "LosslessLoadDiffusionModel", "LosslessLoadCheckpoint", "LosslessLoadCLIP", "LosslessLoadLora",
-                    "LosslessLoadVAE"]:
+                    "LosslessLoadVAE", "LosslessKeepModelCompressed"]:
         info = nodes.NODE_CLASS_MAPPINGS[node_id].GET_NODE_INFO_V1()
         assert info["category"].startswith("optimization")
 

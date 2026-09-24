@@ -104,10 +104,10 @@ def compress_model(model, dtype):
                          "GGUF models are already compressed and don't need it.")
 
     loader, loader_args, *output_index = model.cached_patcher_init
+    if "model_options" not in inspect.signature(loader).parameters:
+        raise ValueError("Compress Model can't rebuild this model through its loader. "
+                         "If it went through Keep Model Compressed, put Compress Model (FP8) before that node.")
     bound = inspect.signature(loader).bind(*loader_args)
-    if bound.arguments.get("model_options", {}).get("custom_operations") is not None:
-        raise ValueError("Compress Model can't convert this model: it was loaded with its own weight storage "
-                         "(for example kept compressed by a Lossless loader). Use one or the other.")
     bound.arguments["model_options"] = {**bound.arguments.get("model_options", {}), "dtype": dtype}
     loaded = loader(*bound.args, **bound.kwargs, disable_dynamic=not model.is_dynamic())
     if output_index:

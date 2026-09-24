@@ -1,16 +1,25 @@
+import gc
 import json
+import os
+import subprocess
+import sys
+import weakref
 
 import pytest
 import safetensors
 import safetensors.torch
 import torch
 
+import comfy.model_management
+import comfy.ops
+import comfy.sd
+import comfy.utils
 import folder_paths
 import nodes
-from conftest import sample
-from lossless import codec, fileformat
-from lossless.nodes import (CompressModelFile, LoadCheckpointLossless, LoadCLIPLossless, LoadDiffusionModelLossless,
-                            LoadLoraLossless, LoadVAELossless)
+from conftest import REPO_ROOT, sample
+from lossless import codec, fileformat, kernels, memory
+from lossless.nodes import (CompressModelFile, KeepModelCompressed, LoadCheckpointLossless, LoadCLIPLossless,
+                            LoadDiffusionModelLossless, LoadLoraLossless, LoadVAELossless)
 from optimizer_nodes import CompressModel, LoadCheckpointFP8
 
 
@@ -200,14 +209,13 @@ def test_lossless_models_can_be_compressed_to_fp8(tiny_diffusion_model):
 
 
 def compressed_weights(model):
-    from comfy.quant_ops import QuantizedTensor
-    return sum(isinstance(p, QuantizedTensor) for p in model.model.diffusion_model.parameters())
+    return sum(memory.is_compressed(p) for p in model.model.diffusion_model.parameters())
 
 
-def with_lora(model):
+def with_lora(model, key="diffusion_model.out.2.weight"):
     patched = model.clone()
-    weight = patched.model.state_dict()["diffusion_model.out.2.weight"]
-    assert patched.add_patches({"diffusion_model.out.2.weight": (torch.full(weight.shape, 0.05),)})
+    weight = patched.model.state_dict()[key]
+    assert patched.add_patches({key: (torch.full(weight.shape, 0.05),)})
     return patched
 
 
@@ -243,22 +251,66 @@ def test_kept_compressed_checkpoint_samples_exactly_like_the_original(tiny_check
     assert torch.equal(sample(kept), sample(original))
 
 
-def test_models_that_cannot_stay_compressed_load_decoded(tiny_diffusion_model, monkeypatch):
-    # Simulates a weight in a layer that can't hold a compressed tensor: loading must fall back, not fail.
-    from lossless import memory
-    monkeypatch.delattr(memory.CompressedWeight, "_load_from_state_dict")
-    compressed = compress_in_comfyui("diffusion_models", tiny_diffusion_model)
-    original = nodes.UNETLoader().load_unet(tiny_diffusion_model, "default")[0]
-    loaded = LoadDiffusionModelLossless.execute(compressed, True).args[0]
-    assert compressed_weights(loaded) == 0
-    assert torch.equal(sample(loaded), sample(original))
+@pytest.mark.parametrize("dtype", list(codec.FORMATS), ids=str)
+def test_keep_model_compressed_works_for_every_weight_dtype(tiny_diffusion_model, dtype):
+    path = folder_paths.get_full_path("diffusion_models", tiny_diffusion_model)
+    original = comfy.sd.load_diffusion_model(path, model_options={"dtype": dtype})
+    assert original.model_dtype() == dtype
+    kept = KeepModelCompressed.execute(original).args[0]
+
+    assert compressed_weights(kept) > 0 and compressed_weights(original) == 0  # the input model is left alone
+    assert torch.equal(sample(kept), sample(original))
+    assert kept.loaded_size() < original.loaded_size()
 
 
-def test_fp8_compression_refuses_kept_compressed_models(tiny_diffusion_model):
-    compressed = compress_in_comfyui("diffusion_models", tiny_diffusion_model)
-    kept = LoadDiffusionModelLossless.execute(compressed, True).args[0]
-    with pytest.raises(ValueError, match="own weight storage"):
-        CompressModel.execute(kept, "fp8_e4m3fn")
+def test_keep_model_compressed_on_a_prequantized_fp8_model(tiny_fp8_quantized_model, monkeypatch):
+    from comfy.quant_ops import QuantizedTensor
+    original = nodes.UNETLoader().load_unet(tiny_fp8_quantized_model, "default")[0]
+    assert original.model.model_config.quant_config is not None
+    kept = KeepModelCompressed.execute(original).args[0]
+
+    wrapped = [p for p in kept.model.diffusion_model.parameters() if memory.is_compressed(p) and p._params.inner]
+    assert wrapped and all(p._params.inner == "TensorCoreFP8E4M3Layout" for p in wrapped)
+    assert torch.equal(sample(kept), sample(original))
+    assert kept.loaded_size() < original.loaded_size()
+
+    # On GPUs the fp8 layers run an fp8 kernel, which must get ComfyUI's own fp8 weight back. The CPU makes these
+    # layers compute in full precision, so switch them to the fp8 path to check it.
+    for model in (original, kept):
+        for module in model.model.diffusion_model.modules():
+            if hasattr(module, "_full_precision_mm"):
+                module._full_precision_mm = False
+    weights_seen, linear = [], torch.nn.functional.linear
+
+    def spy(input, weight, bias=None):
+        if isinstance(input, QuantizedTensor):
+            weights_seen.append(weight._layout_cls)
+        return linear(input, weight, bias)
+    monkeypatch.setattr(torch.nn.functional, "linear", spy)
+    fp8_path_output = sample(kept, steps=2)
+    assert weights_seen and set(weights_seen) == {"TensorCoreFP8E4M3Layout"}
+    assert torch.equal(fp8_path_output, sample(original, steps=2))
+    monkeypatch.undo()
+
+    quantized_layer = "diffusion_model.input_blocks.1.1.transformer_blocks.0.attn1.to_q.weight"
+    assert torch.equal(sample(with_lora(kept, quantized_layer), steps=3), sample(with_lora(original, quantized_layer), steps=3))
+
+    # Offloaded layers apply LoRAs on the fly each step: they get ComfyUI's own fp8 weight, not a compressed one.
+    layers = [comfy.utils.get_attr(model.model, quantized_layer.removesuffix(".weight")) for model in (kept, original)]
+    patched = torch.randn(layers[0].weight.shape)
+    on_the_fly = [layer.set_weight(patched.clone(), seed=7, return_weight=True) for layer in layers]  # (scaled in place)
+    assert not memory.is_compressed(on_the_fly[0]) and on_the_fly[0]._layout_cls == on_the_fly[1]._layout_cls
+    assert same_bits(on_the_fly[0]._qdata, on_the_fly[1]._qdata) and torch.equal(on_the_fly[0]._params.scale, on_the_fly[1]._params.scale)
+
+
+def test_fp8_compression_goes_before_keep_model_compressed(tiny_diffusion_model):
+    model = nodes.UNETLoader().load_unet(tiny_diffusion_model, "default")[0]
+    fp8_kept = KeepModelCompressed.execute(CompressModel.execute(model, "fp8_e4m3fn").args[0]).args[0]
+    assert fp8_kept.model_dtype() == torch.float8_e4m3fn and compressed_weights(fp8_kept) > 0
+    assert torch.isfinite(sample(fp8_kept, steps=2)).all()
+
+    with pytest.raises(ValueError, match="before that node"):
+        CompressModel.execute(KeepModelCompressed.execute(model).args[0], "fp8_e4m3fn")
 
 
 DEVICES = ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU"))]
@@ -278,19 +330,20 @@ def test_encodes_and_decodes_exactly_on_each_device(dtype, device):
 
 
 @pytest.mark.parametrize("device", DEVICES)
-def test_kept_compressed_layer_moves_and_runs_exactly(device):
-    from comfy.quant_ops import QuantizedTensor
-    from lossless import memory
+@pytest.mark.parametrize("ops", ["disable_weight_init", "manual_cast"])
+def test_kept_compressed_layer_moves_and_runs_exactly(ops, device):
     torch.manual_seed(0)
     weight = (torch.randn(512, 1024) * 0.02).to(torch.bfloat16)
-    layer = memory.LosslessOps.Linear(1024, 512, dtype=torch.bfloat16)
-    layer.weight = torch.nn.Parameter(memory.compressed_tensor(*codec.encode(weight)), requires_grad=False)
-    layer.bias = torch.nn.Parameter(torch.zeros(512, dtype=torch.bfloat16), requires_grad=False)
+    bias = torch.zeros(512, dtype=torch.bfloat16)
+    layer = getattr(comfy.ops, ops).Linear(1024, 512, dtype=torch.bfloat16)
+    layer.weight = torch.nn.Parameter(weight.clone(), requires_grad=False)
+    layer.bias = torch.nn.Parameter(bias, requires_grad=False)
+    assert memory.compress_module(layer) is not None
     layer.to(device)
 
-    assert isinstance(layer.weight, QuantizedTensor) and layer.weight.device.type == device
+    assert memory.is_compressed(layer.weight) and layer.weight.device.type == device
     x = torch.randn(4, 1024, dtype=torch.bfloat16, device=device)
-    assert torch.equal(layer(x), torch.nn.functional.linear(x, weight.to(device), layer.bias))
+    assert torch.equal(layer(x), torch.nn.functional.linear(x, weight.to(device), bias.to(device)))
 
 
 def test_safetensors_reader_matches_the_safetensors_library(tmp_path):
@@ -325,3 +378,115 @@ def test_lossless_files_are_never_memory_mapped(tiny_diffusion_model, tiny_lora,
     path = folder_paths.get_full_path("diffusion_models", model)
     assert fileformat.verify(folder_paths.get_full_path("diffusion_models", tiny_diffusion_model), path) == []
     fileformat.decompress_file(path, str(tmp_path / "restored.safetensors"))
+
+
+def test_kept_compressed_layers_are_freed_without_a_garbage_collection(tiny_diffusion_model):
+    # Layers that reference themselves stay in memory (VRAM too) until Python's next full garbage collection.
+    kept = LoadDiffusionModelLossless.execute(compress_in_comfyui("diffusion_models", tiny_diffusion_model), True).args[0]
+    layers = [weakref.ref(m) for m in kept.model.diffusion_model.modules() if memory.is_compressed(getattr(m, "weight", None))]
+    assert layers
+    gc.collect()
+    gc.disable()
+    try:
+        del kept
+        assert all(layer() is None for layer in layers)
+    finally:
+        gc.enable()
+
+
+def test_sampling_reserves_the_memory_decoding_needs(tiny_diffusion_model, monkeypatch):
+    original = nodes.UNETLoader().load_unet(tiny_diffusion_model, "default")[0]
+    kept = LoadDiffusionModelLossless.execute(compress_in_comfyui("diffusion_models", tiny_diffusion_model), True).args[0]
+    requested, load_models_gpu = [], comfy.model_management.load_models_gpu
+
+    def spy(models, memory_required=0, *args, **kwargs):
+        requested.append(memory_required)
+        return load_models_gpu(models, memory_required, *args, **kwargs)
+    monkeypatch.setattr(comfy.model_management, "load_models_gpu", spy)
+    sample(original, steps=1)
+    sample(kept, steps=1)
+
+    assert kept.model.lossless_decode_memory > 0
+    assert requested[1] == pytest.approx(requested[0] + kept.model.lossless_decode_memory)
+    assert "memory_required" not in vars(kept.model)  # only changed while loading
+
+
+class PeakMemory(torch.utils._python_dispatch.TorchDispatchMode):
+    """Largest total size of the tensors created inside it that were alive at the same time. Tensors that already
+    exist (the inputs) are passed in, since views of them look like new tensors."""
+
+    def __init__(self, *existing):
+        super().__init__()
+        self.live = self.peak = 0
+        self.storages = {tensor.untyped_storage().data_ptr() for tensor in existing}
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        for tensor in torch.utils._pytree.tree_flatten(out)[0]:
+            if isinstance(tensor, torch.Tensor) and tensor.untyped_storage().nbytes():
+                storage = tensor.untyped_storage()
+                if storage.data_ptr() not in self.storages:
+                    self.storages.add(storage.data_ptr())
+                    self.live += storage.nbytes()
+                    self.peak = max(self.peak, self.live)
+                    weakref.finalize(storage, self.free, storage.data_ptr(), storage.nbytes())
+        return out
+
+    def free(self, pointer, size):
+        self.live -= size
+        self.storages.discard(pointer)
+
+
+@pytest.mark.parametrize("escapes", ["nonzero_static", "cumsum"])
+@pytest.mark.parametrize("shape", [(256, 4096), (2048, 5000)], ids=["one chunk", "two chunks"])
+@pytest.mark.parametrize("dtype", list(codec.FORMATS), ids=str)
+def test_decoding_stays_within_the_memory_reserved_for_it(dtype, shape, escapes, monkeypatch):
+    # Decoding takes memory next to the model; if ComfyUI reserves less than that, a full GPU runs over.
+    monkeypatch.setitem(codec._NONZERO_STATIC, "cpu", escapes == "nonzero_static")
+    torch.manual_seed(0)
+    weight = (torch.randn(shape) * (50 if dtype == torch.float8_e4m3fn else 0.02)).to(dtype)
+    blob, params = memory.pack(weight, torch.ones(()), dtype, weight.shape, None)
+    with PeakMemory(blob) as peak:
+        decoded = codec.decode(blob, params.info)
+    assert same_bits(decoded, weight)
+    assert peak.peak <= memory.decode_memory(params.info)
+
+
+@pytest.mark.skipif(not kernels.installed(), reason="needs Triton")
+def test_triton_decoder_is_exact():
+    env = dict(os.environ)
+    if not torch.cuda.is_available():
+        env["TRITON_INTERPRET"] = "1"  # Triton's CPU interpreter runs the same kernel
+    result = subprocess.run([sys.executable, os.path.join(REPO_ROOT, "tests", "triton_check.py")], env=env,
+                            capture_output=True, text=True, timeout=1800)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(not kernels.installed(), reason="needs Triton")
+@pytest.mark.parametrize("failure", ["wrong results", "error"])
+def test_a_failing_triton_decoder_falls_back_to_exact_decoding(failure, monkeypatch, caplog):
+    torch.manual_seed(0)
+    weight = (torch.randn(512, 1024) * 0.02).to(torch.bfloat16)
+    layer = comfy.ops.manual_cast.Linear(1024, 512, bias=False, dtype=torch.bfloat16)
+    layer.weight = torch.nn.Parameter(weight.clone(), requires_grad=False)
+    memory.compress_module(layer)
+    assert "tables" in layer.weight._params.info
+
+    class FailingKernel:
+        def __getitem__(self, grid):
+            def launch(blob, luts, starts, out, *args, **kwargs):
+                if failure == "error":
+                    raise RuntimeError("no compiler")
+                out.zero_()
+            return launch
+    # pytest also imports this package under its folder name, and either copy may be the one decoding
+    copies = [module for name, module in list(sys.modules.items()) if name.endswith("lossless.kernels")]
+    for copy in copies:
+        monkeypatch.setattr(copy, "_decode_kernel", FailingKernel())
+        monkeypatch.setattr(copy, "_verified", set())
+        monkeypatch.setitem(copy._state, "broken", False)
+    monkeypatch.setenv("TRITON_INTERPRET", "1")  # lets kernels.usable() pick the kernel on the CPU
+
+    x = torch.randn(4, 1024, dtype=torch.bfloat16)
+    assert torch.equal(layer(x), torch.nn.functional.linear(x, weight))
+    assert any(copy._state["broken"] for copy in copies) and "slower PyTorch decoder" in caplog.text

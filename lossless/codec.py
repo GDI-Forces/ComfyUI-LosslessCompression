@@ -9,13 +9,20 @@ so the exponent is where the savings are:
   the most common exponents a b1-bit code, and its all-ones code means "look in
   the next level", which codes the rarer exponents the same way, down to a last
   level that stores them raw. Each level is a dense stream in element order, so
-  decoding needs no positions: a masked_scatter fills the escapes back in.
+  decoding needs no positions: the escapes are filled back in order.
 
 Everything is plain PyTorch, so decoding runs on the CPU or the GPU. Level-1
 codes are processed in fixed-size chunks to bound temporary memory, and the
 escape count of every chunk is recorded so decoding never waits on the GPU.
+Decoding works on bytes: the output is assembled byte by byte in place, and
+besides the escape positions and table lookups (done in small pieces), each
+temporary takes one byte per value.
 """
+import sys
+
 import torch
+
+assert sys.byteorder == "little", "the decoder assembles values from their bytes"
 
 # dtype: (same-width integer view, exponent bits, mantissa bits)
 FORMATS = {
@@ -46,16 +53,43 @@ def pack_bits(values, width):
     return torch.stack([(acc >> (8 * j)) & 0xFF for j in range(width)], 1).to(torch.uint8).flatten()
 
 
+_CACHE = {}
+
+
+def cached(key, make):
+    """Small constant tensors (lookup tables, shift amounts), made once per device: creating them from Python
+    lists every call would copy them to the GPU and wait for it each time."""
+    value = _CACHE.get(key)
+    if value is None:
+        value = _CACHE[key] = make()
+    return value
+
+
 def unpack_bits(packed, width, count):
+    """Inverse of pack_bits, as uint8. Only ever makes one-byte-per-value temporaries."""
     if width == 8:
         return packed[:count]
+    device, mask = packed.device, (1 << width) - 1
     if 8 % width == 0:
-        shifts = torch.arange(0, 8, width, device=packed.device, dtype=torch.uint8)
-        return ((packed.unsqueeze(1) >> shifts) & ((1 << width) - 1)).flatten()[:count]
-    wide = torch.int32 if width <= 3 else torch.int64
-    acc = (packed.view(-1, width).to(wide) << (torch.arange(width, device=packed.device, dtype=wide) * 8)).sum(1, dtype=wide)
-    values = (acc.unsqueeze(1) >> (torch.arange(8, device=packed.device, dtype=wide) * width)) & ((1 << width) - 1)
-    return values.to(torch.uint8).flatten()[:count]
+        per_byte = 8 // width
+        shifts = cached(("shifts", width, device), lambda: torch.arange(0, 8, width, device=device, dtype=torch.uint8))
+        values = packed[:-(-count // per_byte)].unsqueeze(1) >> shifts
+        values &= mask
+        return values.view(-1)[:count]
+    # Eight values share `width` bytes; value j starts at bit j * width and may straddle two bytes.
+    groups = -(-count // 8)
+    grouped = packed[:groups * width].view(groups, width)
+    values = torch.empty(groups, 8, dtype=torch.uint8, device=packed.device)
+    spill = torch.empty(groups, dtype=torch.uint8, device=packed.device)
+    for j in range(8):
+        byte, shift = divmod(j * width, 8)
+        column = values[:, j]
+        torch.bitwise_right_shift(grouped[:, byte], shift, out=column)
+        if shift + width > 8:
+            torch.bitwise_left_shift(grouped[:, byte + 1], 8 - shift, out=spill)
+            column |= spill
+        column &= mask
+    return values.view(-1)[:count]
 
 
 def split_bits(flat, dtype):
@@ -90,14 +124,16 @@ def plan_levels(counts, e):
     return best
 
 
-def encode(tensor):
+def encode(tensor, chunk=None):
     """(blob, info) for a tensor, or None when compressing it wouldn't save at least 1%.
-    Runs on the tensor's device and returns the blob there."""
+    Runs on the tensor's device and returns the blob there. `chunk` (a multiple of 8, CHUNK by default) bounds
+    the decoder's temporary memory, which takes up to about eight bytes per value of a chunk."""
+    chunk_size = chunk or CHUNK
     if tensor.dtype not in FORMATS or tensor.numel() == 0:
         return None
     _, e, m = FORMATS[tensor.dtype]
     device = tensor.device
-    chunks = tensor.detach().contiguous().view(-1).split(CHUNK)
+    chunks = tensor.detach().contiguous().view(-1).split(chunk_size)
     n = tensor.numel()
 
     counts = sum(torch.bincount(split_bits(c, tensor.dtype)[0], minlength=1 << e) for c in chunks)
@@ -153,7 +189,7 @@ def encode(tensor):
         "shape": list(tensor.shape),
         "levels": levels,
         "counts": level_counts,
-        "chunk": CHUNK,
+        "chunk": chunk_size,
         "chunk_escapes": chunk_escapes,
         "sections": offsets,
     }
@@ -172,39 +208,123 @@ def decode(blob, info):
     n = counts[0]
     device = blob.device
 
-    # Resolve the escape levels from the raw level up, into the level-1 escapes in order.
+    # Resolve the escape levels from the raw level up, into the level-1 escapes in order. These are small.
     escaped_values = unpack_bits(sections[len(levels)], e, counts[len(levels)])
     for i in range(len(levels) - 1, 0, -1):
-        escaped_values = _decode_level(sections[i], levels[i], counts[i], escaped_values, device)
+        escaped_values = _decode_level(unpack_bits(sections[i], levels[i]["bits"], counts[i]), levels[i], escaped_values)
 
     rest_planes, rest_extra = divmod(1 + m, 8)
     rest_sections = sections[len(levels) + 1:]
+    width = torch.empty((), dtype=view).element_size()
     out = torch.empty(n, dtype=view, device=device)
-    level1_bytes = 0
-    escape_offset = 0
+    out_bytes = out.view(torch.uint8).view(n, width)
+    b = levels[0]["bits"]
+    level1_bytes = escape_offset = 0
     for c, begin in enumerate(range(0, n, chunk)):
         size = min(chunk, n - begin)
-        b = levels[0]["bits"]
         packed = sections[0][level1_bytes:level1_bytes + (size + 7) // 8 * b]
         level1_bytes += size // 8 * b  # every chunk but the last is a whole number of groups
         escapes = info["chunk_escapes"][c]
-        exponent = _decode_level(packed, levels[0], size, escaped_values[escape_offset:escape_offset + escapes], device)
+        exponent = _decode_level(unpack_bits(packed, b, size), levels[0], escaped_values[escape_offset:escape_offset + escapes])
         escape_offset += escapes
 
-        # Reassemble in the dtype's own integer width; shifts into the sign bit wrap as intended.
-        rest = torch.zeros(size, dtype=view, device=device)
-        for j in range(rest_planes):
-            rest |= rest_sections[j][begin:begin + size].to(view) << (8 * j)
+        # The rest bits of this chunk, one uint8 per element for each byte of them.
+        rest = [rest_sections[j][begin:begin + size] for j in range(rest_planes)]
         if rest_extra:
             packed = rest_sections[rest_planes][begin // 8 * rest_extra:(begin + size + 7) // 8 * rest_extra]
-            rest |= unpack_bits(packed, rest_extra, size).to(view) << (8 * rest_planes)
-        sign = (rest >> m) & 1
-        out[begin:begin + size] = (sign << (e + m)) | (exponent.to(view) << m) | (rest & ((1 << m) - 1))
+            rest.append(unpack_bits(packed, rest_extra, size))
+        _assemble(out_bytes[begin:begin + size], exponent, rest, e, m)
     return out.view(dtype).view(info["shape"])
 
 
-def _decode_level(packed, level, count, escaped_values, device):
-    codes = unpack_bits(packed, level["bits"], count)
-    lut = torch.tensor(level["lut"] + [0], dtype=torch.uint8, device=device)
-    values = lut.index_select(0, codes.to(torch.int32))
-    return values.masked_scatter_(codes == (1 << level["bits"]) - 1, escaped_values)
+def _assemble(out_bytes, exponent, rest, e, m):
+    """Writes sign, exponent and mantissa into each byte of the output, using uint8 operations only.
+    rest[j] holds bits 8j..8j+7 of (sign << m | mantissa)."""
+    scratch = torch.empty_like(exponent)
+    width = out_bytes.shape[1]
+    for k in range(width):
+        byte = out_bytes[:, k]
+        written = False
+
+        def put(value):
+            nonlocal written
+            if written:
+                byte.bitwise_or_(value)
+            else:
+                byte.copy_(value)
+                written = True
+
+        mantissa_bits = min(max(m - 8 * k, 0), 8)
+        if mantissa_bits == 8:
+            put(rest[k])
+        elif mantissa_bits:
+            put(torch.bitwise_and(rest[k], (1 << mantissa_bits) - 1, out=scratch))
+        shift = m - 8 * k  # where the exponent starts, relative to this byte
+        if 0 <= shift < 8:
+            put(torch.bitwise_left_shift(exponent, shift, out=scratch))  # uint8: bits past this byte fall off
+        elif -e < shift < 0:
+            put(torch.bitwise_right_shift(exponent, -shift, out=scratch))
+        if k == width - 1:  # the sign is bit m of rest, and the top bit of the value
+            sign = torch.bitwise_right_shift(rest[m // 8], m % 8, out=scratch)
+            put(sign.bitwise_left_shift_(7))
+        if not written:
+            byte.zero_()
+
+
+LOOKUP_PIECE = 1 << 20  # codes widened to int32 at a time for the table lookup
+
+
+def temporary_memory(info):
+    """An upper bound on the temporary memory decode() takes for a blob, besides its output. The escape streams
+    are decoded whole first (about 2-8 bytes per entry, plus 9 per entry of the stream after), then the values a
+    chunk at a time (up to 8 bytes per value and 8 per escape, next to the level-1 escapes)."""
+    counts, chunk = info["counts"], min(info["counts"][0], info["chunk"])
+    streams = max((8 * counts[i] + 9 * counts[i + 1] + 4 * min(counts[i], LOOKUP_PIECE)
+                   for i in range(1, len(info["levels"]))), default=0)
+    chunks = counts[1] + 8 * chunk + 8 * max(info["chunk_escapes"]) + 4 * min(chunk, LOOKUP_PIECE)
+    return max(streams, chunks, 9 * counts[len(info["levels"])])
+
+
+def _decode_level(codes, level, escaped_values):
+    """Maps a level's codes to exponents through its table and puts the escaped ones in place, as uint8."""
+    device = codes.device
+    lut = cached(("lut", tuple(level["lut"]), device),
+                 lambda: torch.tensor(level["lut"] + [0], dtype=torch.uint8, device=device))
+    escaped = codes == (1 << level["bits"]) - 1 if escaped_values.numel() else None
+    positions = _positions(escaped, escaped_values.numel()) if escaped is not None else None
+    if positions is not None:
+        escaped = None  # not needed any more; free it before the lookup
+    values = torch.empty_like(codes)
+    for begin in range(0, codes.numel(), LOOKUP_PIECE):
+        piece = codes[begin:begin + LOOKUP_PIECE]
+        torch.index_select(lut, 0, piece.to(torch.int32), out=values[begin:begin + LOOKUP_PIECE])
+    if positions is not None:
+        values.index_put_((positions,), escaped_values)
+    elif escaped is not None:
+        # Without nonzero_static: the rank of each escape among the escapes, then a gather. Four bytes per value.
+        rank = escaped.to(torch.int32)
+        rank.cumsum_(0)
+        rank -= 1
+        rank.clamp_(min=0)
+        torch.where(escaped, escaped_values.index_select(0, rank), values, out=values)
+    return values
+
+
+_NONZERO_STATIC = {}  # device type: whether nonzero_static works there
+
+
+def _positions(mask, count):
+    """Positions of the `count` set elements of mask, found without waiting on the GPU (the count is known), or
+    None where nonzero_static isn't available. Eight bytes per escape; masked_scatter would take eight per value."""
+    kind = mask.device.type
+    if not _NONZERO_STATIC.get(kind, True):
+        return None
+    try:
+        positions = torch.nonzero_static(mask, size=count).view(-1)
+    except (AttributeError, NotImplementedError, RuntimeError):
+        if kind in _NONZERO_STATIC:
+            raise
+        _NONZERO_STATIC[kind] = False
+        return None
+    _NONZERO_STATIC[kind] = True
+    return positions
