@@ -157,15 +157,6 @@ python custom_nodes/ComfyUINodeTest/lossless_compress.py decompress model.lossle
 `compress` verifies its output unless you pass `--no-verify`. `decompress` gives back a regular `.safetensors`
 file with the original tensors and metadata, so nothing is ever locked into this format.
 
-### Limits
-
-- VAEs and LoRAs can be compressed with the command line, but there are no lossless loader nodes for them yet.
-- With `keep_compressed` off, a decoded model sits in RAM like a model loaded from a `.ckpt` file. ComfyUI can't
-  page it back to disk the way it does with memory-mapped `.safetensors` files, so on a machine with little RAM
-  the original file may load more comfortably.
-- Speeds were only measured on a 4-thread CPU here (about 65 MB/s to compress and 180 MB/s to decode bf16).
-  GPU speed and the per-step cost of `keep_compressed` haven't been measured yet.
-
 ## Measuring the speed-up on your GPU
 
 `benchmark.py` runs one of your own workflows with each optimization on and off and reports time and peak VRAM.
