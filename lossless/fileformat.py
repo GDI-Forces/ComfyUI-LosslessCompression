@@ -11,6 +11,7 @@ import os
 import shutil
 import tempfile
 
+import safetensors
 import torch
 
 from . import codec
@@ -27,46 +28,6 @@ SAFETENSORS_DTYPES = {
     torch.int64: "I64", torch.int32: "I32", torch.int16: "I16", torch.int8: "I8",
     torch.uint64: "U64", torch.uint32: "U32", torch.uint16: "U16", torch.uint8: "U8", torch.bool: "BOOL",
 }
-DTYPES = {name: dtype for dtype, name in SAFETENSORS_DTYPES.items()}
-
-
-class SafetensorsFile:
-    """Reads a .safetensors file one tensor at a time with ordinary file reads.
-
-    The safetensors library memory-maps the whole file copy-on-write, and Windows charges such a mapping
-    in full against the paging file up front, so opening a big file fails ("The paging file is too small",
-    os error 1455) whenever much memory is already committed, e.g. by ComfyUI's pinned memory. Plain
-    reads only take the memory of the tensors actually read."""
-
-    def __init__(self, path):
-        self._file = open(path, "rb")
-        size = int.from_bytes(self._file.read(8), "little")
-        self.header = json.loads(self._file.read(size))
-        self.metadata = self.header.pop("__metadata__", None)
-        self._base = 8 + size
-
-    def keys(self):
-        return list(self.header)
-
-    def get(self, name):
-        info = self.header[name]
-        start, end = info["data_offsets"]
-        data = torch.empty(end - start, dtype=torch.uint8)
-        view = memoryview(data.numpy())
-        self._file.seek(self._base + start)
-        done = 0
-        while done < len(view):  # Windows reads at most 2 GB at a time
-            count = self._file.readinto(view[done:done + (1 << 30)])
-            if not count:
-                raise ValueError(f"{name} extends past the end of the file")
-            done += count
-        return data.view(DTYPES[info["dtype"]]).reshape(info["shape"])
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self._file.close()
 
 
 def is_compressed(metadata):
@@ -83,9 +44,7 @@ def compress_file(src, dst, on_tensor=None, device=None):
         nonlocal original, written
         for done, (name, tensor) in enumerate(tensors, 1):
             original += tensor.nbytes
-            encoded = None
-            if tensor.numel() >= MIN_ELEMENTS:
-                encoded = codec.run_on(device, codec.encode_memory(tensor), lambda on: _encode(tensor, on))
+            encoded = codec.encode(tensor.to(device) if device else tensor) if tensor.numel() >= MIN_ELEMENTS else None
             if encoded is None:
                 written += tensor.nbytes
                 yield name, tensor
@@ -108,30 +67,20 @@ def compress_file(src, dst, on_tensor=None, device=None):
 def load(path, device=None):
     """(state_dict, metadata) of any .safetensors file, decoding a compressed one.
     Blobs are decoded on `device` (the GPU is much faster) and returned on the CPU."""
-    with SafetensorsFile(path) as f:
-        metadata = f.metadata
+    with safetensors.safe_open(path, framework="pt") as f:
+        metadata = f.metadata()
         if not is_compressed(metadata):
-            return {k: f.get(k) for k in f.keys()}, metadata
+            return {k: f.get_tensor(k) for k in f.keys()}, metadata
         infos = json.loads(metadata[TENSORS_KEY])
         state_dict = {}
         for key in f.keys():
-            tensor = f.get(key)
+            tensor = f.get_tensor(key)
             if key.endswith(BLOB_SUFFIX):
                 name = key[:-len(BLOB_SUFFIX)]
-                state_dict[name] = _decode(tensor, infos[name], device)
+                state_dict[name] = codec.decode(tensor.to(device) if device else tensor, infos[name]).cpu()
             else:
                 state_dict[key] = tensor
     return state_dict, json.loads(metadata[METADATA_KEY]) or None
-
-
-def _encode(tensor, device):
-    encoded = codec.encode(tensor.to(device))
-    return None if encoded is None else (encoded[0].cpu(), encoded[1])
-
-
-def _decode(blob, info, device):
-    """Decodes a blob on `device` when it has room (the GPU is much faster), else on the CPU; returns it on the CPU."""
-    return codec.run_on(device, codec.decode_memory(blob, info), lambda on: codec.decode(blob.to(on), info).cpu())
 
 
 def verify(original, compressed, device=None):
@@ -139,8 +88,8 @@ def verify(original, compressed, device=None):
     An empty list means the compressed file restores the original exactly, metadata included."""
     metadata, _, tensors = _read(original)
     problems = []
-    with SafetensorsFile(compressed) as f:
-        stored = f.metadata
+    with safetensors.safe_open(compressed, framework="pt") as f:
+        stored = f.metadata()
         if not is_compressed(stored):
             return ["(not a compressed file)"]
         infos = json.loads(stored[TENSORS_KEY])
@@ -148,11 +97,11 @@ def verify(original, compressed, device=None):
         for name, tensor in tensors:
             if name in infos:
                 remaining.discard(name + BLOB_SUFFIX)
-                blob = f.get(name + BLOB_SUFFIX)
-                restored = _decode(blob, infos[name], device)
+                blob = f.get_tensor(name + BLOB_SUFFIX)
+                restored = codec.decode(blob.to(device) if device else blob, infos[name]).cpu()
             elif name in remaining:
                 remaining.discard(name)
-                restored = f.get(name)
+                restored = f.get_tensor(name)
             else:
                 problems.append(name)
                 continue
@@ -178,13 +127,13 @@ def decompress_file(src, dst, device=None):
 def _read(path):
     """(metadata, tensor count, lazy (name, tensor) pairs) of a model file."""
     if path.endswith(".safetensors"):
-        with SafetensorsFile(path) as f:
-            metadata, keys = f.metadata, f.keys()
+        with safetensors.safe_open(path, framework="pt") as f:
+            metadata, keys = f.metadata(), list(f.keys())
 
         def tensors():
-            with SafetensorsFile(path) as f:
+            with safetensors.safe_open(path, framework="pt") as f:
                 for key in keys:
-                    yield key, f.get(key)
+                    yield key, f.get_tensor(key)
         return metadata, len(keys), tensors()
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     checkpoint = checkpoint.get("state_dict", checkpoint)
