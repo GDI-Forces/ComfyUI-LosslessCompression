@@ -8,13 +8,14 @@ hooks, so its memory manager, LoRAs and other model patches keep working.
 | Node | What it does |
 | --- | --- |
 | **Speed Up Model** | Faster attention (SageAttention / FlashAttention), fp16 accumulation, step caching and `torch.compile`, from one node. |
-| **Load Checkpoint (FP8, Low VRAM)** | Loads a checkpoint with the diffusion model stored in fp8, halving the VRAM its weights need. |
-| **Compress Model (FP8)** | Converts any loaded model's weights to fp8, halving their VRAM, and keeps LoRAs and patches. |
+| **Load Checkpoint (FP8/INT8, Low VRAM)** | Loads a checkpoint with the diffusion model stored in fp8 or int8 convrot, halving the VRAM its weights need. |
+| **Compress Model (FP8/INT8)** | Converts any loaded model's weights to fp8 or int8 convrot, halving their VRAM, and keeps LoRAs and patches. |
 | **Compact VRAM Before Load** | Right before a model loads onto the GPU, unloads the other models and clears cached memory so it gets the most free VRAM. |
 | **Free VRAM** | Passthrough node that unloads models and clears the GPU cache between stages of a workflow. |
 | **Compress Model File (Lossless)** | Writes a smaller copy of a model file whose weights decode to exactly the original bits. |
 | **Load Diffusion Model / Checkpoint / CLIP (Lossless)** | Load those files; the diffusion model and checkpoint loaders can keep the weights compressed in RAM and VRAM. |
 | **Load LoRA / VAE (Lossless)** | Apply a compressed LoRA or load a compressed VAE, exactly like the regular nodes. |
+| **Keep Model Compressed (Lossless VRAM)** | Keeps any loaded model's weights losslessly compressed in RAM and VRAM: less VRAM, identical results, slower steps. |
 
 They are under the **optimization** category in the node menu (the lossless ones under **optimization/lossless**).
 
@@ -58,29 +59,36 @@ The node logs what it applied, e.g. `Speed Up Model: sage attention, step cache 
 Its step cache always uses EasyCache's default 15%–95% window. For finer control, use the
 built-in **EasyCache** node instead and leave `step_cache` at 0.
 
-### Load Checkpoint (FP8, Low VRAM)
+### Load Checkpoint (FP8/INT8, Low VRAM)
 
-This is a drop-in replacement for `Load Checkpoint`. It stores the diffusion model's weights in fp8 and
-converts each layer back up as it runs. The weights take half the VRAM of fp16/bf16, so a
-model that used to spill into system RAM can fit on the GPU.
-`fp8_e4m3fn` suits most models. `default` behaves like the regular loader, which is handy for A/B comparisons.
+This is a drop-in replacement for `Load Checkpoint`. It stores the diffusion model's weights in fp8 or int8 and
+converts each layer back up as it runs (fp8), or runs it with int8 matrix multiplies (int8 convrot). The weights take
+half the VRAM of fp16/bf16, so a model that used to spill into system RAM can fit on the GPU.
+`fp8_e4m3fn` suits most models. `int8_convrot` keeps more precision (see below). `default` behaves like the
+regular loader, which is handy for A/B comparisons.
 For standalone diffusion model files, the built-in `Load Diffusion Model` node already has a
-`weight_dtype` option that does the same.
+`weight_dtype` option that does the same for fp8.
 
-### Compress Model (FP8)
+### Compress Model (FP8/INT8)
 
 Takes a model from any core loader (`Load Diffusion Model`, `Load Checkpoint`, including after LoRAs) and outputs
-a copy whose weights are stored in fp8. Each layer is converted back up as it runs. The weights need half the VRAM
+a copy whose weights are stored in fp8 or int8. The weights need half the VRAM
 of fp16/bf16: roughly 14 GB instead of 28 GB for Wan 14B, 12 GB instead of 24 GB for Flux, 2.5 GB instead of 5 GB
 for an SDXL UNet. The console confirms it, e.g. `Compress Model: torch.bfloat16 -> torch.float8_e4m3fn weights`.
 
 - It rebuilds the weights from the model file through the model's own loader, exactly like the loaders'
   `weight_dtype` fp8 option, then moves the LoRAs, patches and options already on the model onto them.
   The input model is left unchanged.
-- Models already stored in fp8 or loaded from a pre-quantized file pass through unchanged. Models from
+- Models already stored in fp8 (for `fp8_*`) or loaded from a pre-quantized file pass through unchanged. Models from
   custom loaders that don't record how they were loaded (such as GGUF loaders, whose models are already
   compressed) stop the workflow with an error explaining this.
 - fp8 is lossy. Results change a little, usually not visibly. `fp8_e4m3fn` suits most models.
+- `int8_convrot` gives each linear layer's weights the same treatment as ComfyUI's int8 convrot files: the weight
+  is rotated in groups (which spreads out outliers), quantized to int8 with one scale per output channel, and
+  marked so ComfyUI runs it with its int8 kernels. That keeps more precision than fp8. Layers that aren't linear
+  (convolutions, norms, embeddings) and layers under 16384 weights stay as they are. Loading a model this way
+  needs a moment of extra work: the original weights are loaded once and converted layer by layer, on the GPU
+  when there is room and on the CPU otherwise.
 - If your loader already has a `weight_dtype` option, setting fp8 there saves the same VRAM and a bit of loading time.
 
 ### Compact VRAM Before Load
@@ -104,8 +112,8 @@ when next used, so leave it out of workflows where everything already fits.
 
 ## Lossless model compression
 
-The fp8 nodes save more memory but change the weights slightly. The lossless tools keep every weight
-**bit for bit identical**, in whatever dtype it already has (fp32, fp16, bf16, fp8), so results are exactly
+The fp8 and int8 nodes save more memory but change the weights slightly. The lossless tools keep every weight
+**bit for bit identical**, in whatever dtype it already has (fp32, fp16, bf16, fp8, int8), so results are exactly
 the same as with the original file.
 
 How much it saves, measured on 25M real trained parameters (every tensor verified bit-exact):
@@ -116,6 +124,14 @@ How much it saves, measured on 25M real trained parameters (every tensor verifie
 | fp8 e5m2 / e4m3fn | 25% / 22% | 27% / 24% |
 | fp32 | 16% | 16% |
 | fp16 | 13% | 13% |
+| int8 convrot (ComfyUI's int8 convrot files) | 9–23% | 11–25% |
+| int8 without rotation | 9–61% | 11–72% |
+
+The int8 rows are measured on weights quantized here, from layers with and without a few outlier channels
+(no real int8 model was available to measure). Rotation spreads the int8 values over their whole range, which
+is good for precision and leaves less to compress. The more outliers a layer has, the more it saves.
+Which of the int8 value's bits count as its "exponent" is picked per tensor. Values spread evenly over the whole
+int8 range can't be compressed and are stored as they are.
 
 For example, a 28 GB bf16 model becomes about 19 GB. Lossless compression can't go much further: in trained
 weights the sign and mantissa bits are close to random, and only the exponent bits are predictable. The tools
@@ -140,17 +156,65 @@ of the theoretical limit.
 
    The results are identical to the regular nodes with the original file.
 
-The diffusion model and checkpoint loaders have a `keep_compressed` option:
+### Using less VRAM: keeping the weights compressed
 
-- **Off (default):** the weights are decoded once while loading. Generation is exactly as fast as with the
-  original file; only disk space (and download size) is saved. Decoding runs on the GPU when there is one.
-- **On (experimental):** the weights stay compressed in RAM and VRAM, and each layer is decoded when it runs,
-  so the model takes about as much memory as the file (for bf16, ~31% less VRAM and RAM). Every step gets
-  slower because of the decoding; the cost is smaller for big video models, where each step does a lot of
-  work per weight, than for small image models. LoRAs work and stay compressed. Models loaded this way use
-  ComfyUI's classic memory manager rather than DynamicVRAM, can't also go through Compress Model (FP8), and
-  haven't been tried with `torch.compile`. Files that were already quantized (fp8 "scaled" or other ComfyUI
-  quantized formats) are loaded decoded.
+On their own, compressed files only save disk space: the loaders decode the weights while loading, so generation is
+exactly as fast as with the original file. To save RAM and VRAM as well, keep the weights compressed in memory, in
+either of two ways:
+
+- Turn on `keep_compressed` in **Load Diffusion Model (Lossless)** or **Load Checkpoint (Lossless)**.
+- Or put **Keep Model Compressed (Lossless VRAM)** right after any model loader (after your LoRAs, and after
+  Compress Model (FP8/INT8) if you use it). It works with regular model files too, so no `.lossless` file is needed.
+
+Each layer's weight then stays compressed in RAM and VRAM and is decoded just before the layer runs, so the results
+are exactly the same. How much less memory the weights take:
+
+| Weights stored as | Less RAM and VRAM for them |
+| --- | --- |
+| bf16 | ~31% |
+| fp8 e5m2 / e4m3fn (also from a loader's `weight_dtype` or Compress Model (FP8)) | ~22–26% |
+| fp32 | ~16% |
+| fp16 | ~13% |
+| ComfyUI's pre-quantized fp8 files ("fp8 scaled", "mixed precision") | ~13% |
+| int8 convrot (ComfyUI's files, or Compress Model (INT8)) | ~9–23% |
+| 4-bit layers (nvfp4 and similar) | none: they are left as they are, their packed data doesn't compress |
+
+fp8 and int8 layers stay fp8 and int8 layers: right before ComfyUI's fp8 or int8 matrix multiply runs, the layer gets
+its own quantized weight back, with its scale and settings (int8 convrot included), so it computes exactly as before.
+
+**Checking that it works.** When the model loads, the console says how much it saves:
+`<model>: <N> layer weights kept compressed. The model's weights take <X> GB of RAM and VRAM instead of <Y> GB (<Z>% less).`
+ComfyUI's own `loaded completely; … MB loaded` (or `loaded partially; … MB loaded, … MB offloaded`) line shows the
+compressed size too. If no such line appears, the weights aren't kept compressed: check the console for a warning.
+Task Manager and `nvidia-smi` are a poor measure: they include memory PyTorch keeps cached, and when a model doesn't
+fit, ComfyUI fills the free VRAM with as much of it as fits either way. Then the saving shows as fewer MB offloaded
+(less streaming from RAM each step) rather than less VRAM in use.
+
+Things to know:
+
+- Every step is slower, because each layer is decoded every time it runs. The cost is smaller for big video models,
+  where each step does a lot of work per weight, than for small image models. If the smaller model now fits entirely
+  on your GPU where it didn't before, avoiding the constant streaming of weights can make up for it.
+- **Install Triton for speed.** With Triton, each weight is decoded by one GPU kernel that reads the compressed bytes
+  once and writes the weight once. Without it, a PyTorch decoder runs a few dozen small GPU operations per weight
+  instead. Linux PyTorch CUDA builds usually include it. On Windows install `triton-windows` in ComfyUI's Python, in
+  the version that matches your PyTorch (for PyTorch 2.8: `python_embeded\python.exe -m pip install "triton-windows<3.5"`).
+  The console says `Lossless: decoding compressed weights with Triton.` once the kernel is in use, and otherwise
+  suggests installing it. The kernel checks its
+  first result for each weight format against the PyTorch decoder, and if they ever differ, or Triton fails to
+  compile, it switches itself off and logs why.
+- **Decoding needs VRAM next to the model**: room for the decoded layer, plus a few bytes per value for the PyTorch
+  decoder. These models tell ComfyUI how much, so it keeps that much free when it decides how much of the model to
+  load. (Without that, decoding on a nearly full GPU can go over the limit, and on Windows the driver then moves the
+  overflow to shared GPU memory in system RAM: every following step and generation gets much slower.)
+- These models use ComfyUI's classic memory manager rather than DynamicVRAM, which manages the weights itself.
+- LoRAs work and give exactly what they give on the uncompressed model; the weights they change are compressed
+  again (fp8 and int8 layers are requantized in their own format first, as ComfyUI does).
+- Put Compress Model (FP8/INT8) before them, not after. They haven't been tried with `torch.compile`.
+- `keep_compressed` loads a compressed bf16, fp16 or fp32 file straight into compressed layers. ComfyUI's
+  pre-quantized fp8 and int8 files need ComfyUI's own quantized layers to load, so those are loaded decoded and then
+  compressed layer by layer, which takes more RAM while the model loads. Keep Model Compressed always works that way:
+  ComfyUI loads its own copy of the model, then its layers are compressed one by one.
 
 ### Command line
 
@@ -174,8 +238,12 @@ file with the original tensors and metadata, so nothing is ever locked into this
 - With `keep_compressed` off, a decoded model sits in RAM like a model loaded from a `.ckpt` file. ComfyUI can't
   page it back to disk the way it does with memory-mapped `.safetensors` files, so on a machine with little RAM
   the original file may load more comfortably.
-- Speeds were only measured on a 4-thread CPU here (about 65 MB/s to compress and 180 MB/s to decode bf16).
-  GPU speed and the per-step cost of `keep_compressed` haven't been measured yet.
+- Speeds were only measured on a 4-thread CPU here (about 70 MB/s to compress and 60–300 MB/s to decode,
+  depending on the format). The Triton kernel is checked bit for bit in Triton's CPU interpreter, but GPU speed and
+  the per-step cost of `keep_compressed` haven't been measured yet.
+- Task Manager's VRAM figure includes memory PyTorch keeps cached, so it can look unchanged when the weights are kept
+  compressed. The console's "layer weights kept compressed" and "loaded completely/partially … MB" lines show how much
+  the model really takes.
 
 ## Measuring the speed-up on your GPU
 
