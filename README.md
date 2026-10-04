@@ -1,3 +1,5 @@
+This version resolves the VRAM issues with lossless compression and fixes the progressive slowdown that affected generations over time. INT8 support has also been restored.
+
 # ComfyUI VRAM & Speed Optimizer
 
 Custom nodes that make image and video generation faster and use less VRAM.
