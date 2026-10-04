@@ -3,6 +3,7 @@
 Point COMFYUI_PATH at a ComfyUI folder and run pytest from a Python environment
 that has ComfyUI's requirements installed.
 """
+import json
 import os
 import sys
 
@@ -68,6 +69,70 @@ def tiny_diffusion_model(tmp_path_factory, tiny_unet_weights):
     comfy.utils.save_torch_file(dict(tiny_unet_weights), str(folder / "tiny_sd15_unet.safetensors"))
     folder_paths.add_model_folder_path("diffusion_models", str(folder))
     return "tiny_sd15_unet.safetensors"
+
+
+def fp8_file(tmp_path_factory, tiny_unet_weights, name, scaled):
+    """The tiny UNet with every 2-D (linear) weight stored as fp8 with a per-tensor scale, in one of ComfyUI's two
+    formats for that: "mixed precision" (a comfy_quant marker and a weight_scale per layer), or the older "scaled"
+    format (a scale_weight per layer and a scaled_fp8 marker for the file)."""
+    marker = torch.tensor(list(json.dumps({"format": "float8_e4m3fn"}).encode()), dtype=torch.uint8)
+    state_dict = {}
+    for key, weight in tiny_unet_weights.items():
+        if key.endswith(".weight") and weight.ndim == 2:
+            layer = key[:-len(".weight")]
+            scale = weight.abs().amax().float() / torch.finfo(torch.float8_e4m3fn).max
+            state_dict[key] = (weight / scale).to(torch.float8_e4m3fn)
+            if scaled:
+                state_dict[f"{layer}.scale_weight"] = scale.reshape(1)
+            else:
+                state_dict[f"{layer}.weight_scale"] = scale
+                state_dict[f"{layer}.comfy_quant"] = marker.clone()
+        else:
+            state_dict[key] = weight
+    if scaled:
+        state_dict["scaled_fp8"] = torch.empty(0, dtype=torch.float8_e4m3fn)
+    folder = tmp_path_factory.mktemp(f"diffusion_models_{name}")
+    comfy.utils.save_torch_file(state_dict, str(folder / f"tiny_sd15_{name}.safetensors"))
+    folder_paths.add_model_folder_path("diffusion_models", str(folder))
+    return f"tiny_sd15_{name}.safetensors"
+
+
+@pytest.fixture(scope="session")
+def tiny_fp8_mixed_model(tmp_path_factory, tiny_unet_weights):
+    return fp8_file(tmp_path_factory, tiny_unet_weights, "fp8_mixed", scaled=False)
+
+
+@pytest.fixture(scope="session")
+def tiny_fp8_scaled_model(tmp_path_factory, tiny_unet_weights):
+    return fp8_file(tmp_path_factory, tiny_unet_weights, "fp8_scaled", scaled=True)
+
+
+def convrot_group_size(in_features):
+    """The largest ConvRot group size (a power of 4) that divides a layer's input width, or None."""
+    return next((size for size in (256, 64, 16) if in_features % size == 0), None)
+
+
+@pytest.fixture(scope="session")
+def tiny_int8_convrot_model(tmp_path_factory, tiny_unet_weights):
+    """The tiny UNet as a ComfyUI int8 convrot file: every 2-D (linear) weight rotated and stored as int8 with a
+    per-output-channel scale, and a comfy_quant marker saying so."""
+    from comfy.quant_ops import QuantizedTensor
+    state_dict = {}
+    for key, weight in tiny_unet_weights.items():
+        group = convrot_group_size(weight.shape[1]) if key.endswith(".weight") and weight.ndim == 2 else None
+        if group is None:
+            state_dict[key] = weight
+            continue
+        layer = key[:-len(".weight")]
+        quantized = QuantizedTensor.from_float(weight, "TensorWiseINT8Layout", per_channel=True, convrot=True, convrot_groupsize=group)
+        state_dict[key] = quantized._qdata
+        state_dict[f"{layer}.weight_scale"] = quantized._params.scale.float()
+        marker = {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": group}
+        state_dict[f"{layer}.comfy_quant"] = torch.tensor(list(json.dumps(marker).encode()), dtype=torch.uint8)
+    folder = tmp_path_factory.mktemp("diffusion_models_int8")
+    comfy.utils.save_torch_file(state_dict, str(folder / "tiny_sd15_int8_convrot.safetensors"))
+    folder_paths.add_model_folder_path("diffusion_models", str(folder))
+    return "tiny_sd15_int8_convrot.safetensors"
 
 
 @pytest.fixture(scope="session")

@@ -25,7 +25,7 @@ ALIGN = 16
 
 _state = {"broken": False, "logged": False}
 _verified = set()
-_decode_kernel = None  # imported on first use, so nothing imports Triton unless it decodes
+_decode_kernel = None  # imported by the first usable() check, so nothing imports Triton unless it may decode
 
 
 def installed():

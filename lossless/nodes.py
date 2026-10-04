@@ -1,25 +1,28 @@
-"""ComfyUI nodes for losslessly compressed model files.
+"""ComfyUI nodes for losslessly compressed model files, and for keeping any model's weights compressed in memory.
 
 The loaders decode the file back into the exact original weights and hand them to
 ComfyUI's normal loading code, so a compressed model behaves bit for bit like the
 original. Each loader records how to reload its model, so torch.compile, multi-GPU
-and Compress Model (FP8) work with it like with the built-in loaders.
+and Compress Model (FP8/INT8) work with it like with the built-in loaders.
 """
 import logging
 import os
+import uuid
 
 import comfy.model_management
+import comfy.patcher_extension
 import comfy.sd
 import comfy.utils
 import folder_paths
 import nodes
 from comfy_api.latest import io, ui
 
-from . import fileformat, memory
+from . import fileformat, kernels, memory
 
 CATEGORY = "optimization/lossless"
 COMPRESSIBLE_FOLDERS = ["diffusion_models", "checkpoints", "text_encoders", "loras", "vae"]
 MARKER = ".lossless."
+GB = 1024 ** 3
 
 
 def compressed_files(folder):
@@ -42,21 +45,43 @@ def keep_compressed_options(keep_compressed):
 
 
 def load_model(loader, path, prefix, model_options, disable_dynamic):
-    """Runs a ComfyUI state-dict loader, keeping the weights compressed when model_options ask for it
-    and the model allows it, and decoding them otherwise."""
-    if model_options.get("custom_operations") is memory.LosslessOps:
-        loaded = memory.load_keeping_compressed(path, prefix)
-        if loaded is not None:
-            try:
-                # Kept-compressed weights are tested with ComfyUI's classic memory manager, not DynamicVRAM.
-                return loader(*loaded, model_options, True)
-            except (TypeError, AttributeError, RuntimeError) as e:  # a compressed weight reached a layer that can't hold one
-                logging.warning(f"{os.path.basename(path)} can't stay compressed in memory ({e}); loading it decoded.")
-            loaded = None  # don't hold the compressed weights while the decoded ones load
-        else:
-            logging.info(f"{os.path.basename(path)} is already quantized, so it is loaded decoded.")
-        model_options = {k: v for k, v in model_options.items() if k != "custom_operations"}
-    return loader(*load_state_dict(path), model_options, disable_dynamic)
+    """Runs a ComfyUI state-dict loader on a compressed file, decoding it, or with the keep-compressed option
+    leaving the layer weights compressed where ComfyUI's layers can take them that way. What can't (ComfyUI's
+    pre-quantized fp8 and int8 files, whose quantized layers need their data to load) is loaded decoded, for
+    keep_weights_compressed to compress afterwards."""
+    if model_options.get("custom_operations") is not memory.LosslessOps:
+        return loader(*load_state_dict(path), model_options, disable_dynamic)
+    # Kept-compressed weights use ComfyUI's classic memory manager: DynamicVRAM manages the weights itself.
+    loaded = memory.load_keeping_compressed(path, prefix, decode_device())
+    if loaded is not None:
+        try:
+            return loader(*loaded, model_options, True)
+        except (TypeError, AttributeError, RuntimeError) as e:
+            logging.warning(f"{os.path.basename(path)}: loading the weights compressed failed ({e}); loading them "
+                            "decoded and compressing them afterwards, which takes more RAM while loading.")
+        loaded = None  # don't hold the compressed weights while the decoded ones load
+    options = {k: v for k, v in model_options.items() if k != "custom_operations"}
+    return loader(*load_state_dict(path), options, True)
+
+
+def keep_weights_compressed(model, name):
+    """Compresses the layer weights of a model just loaded with ComfyUI's classic memory manager in place (those
+    not compressed yet), makes ComfyUI keep free the memory decoding needs, and reports the saving."""
+    device = decode_device()
+    before, after, count = memory.compress_in_memory(model, device)
+    prepare = comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING
+    model.remove_wrappers_with_key(prepare, memory.RESERVE_KEY)
+    model.add_wrapper_with_key(prepare, memory.RESERVE_KEY, memory.reserve_decode_memory)
+    if count == 0:
+        logging.warning(f"{name}: no weights could be kept compressed. 4-bit layers, and data that doesn't compress, "
+                        "are left as they are.")
+        return
+    total = model.model_size()
+    original = total + before - after
+    logging.info(f"{name}: {count} layer weights kept compressed. The model's weights take {total / GB:.2f} GB of RAM and "
+                 f"VRAM instead of {original / GB:.2f} GB ({100 * (original - total) / original:.1f}% less).")
+    if device is not None and device.type == "cuda" and not kernels.usable(device):
+        logging.info("Lossless: install Triton (triton-windows on Windows) to decode compressed weights much faster.")
 
 
 def load_diffusion_model(path, model_options={}, disable_dynamic=False):
@@ -65,6 +90,8 @@ def load_diffusion_model(path, model_options={}, disable_dynamic=False):
     model = load_model(loader, path, "", model_options, disable_dynamic)
     if model is None:
         raise RuntimeError(f"Could not detect the model type of {path}")
+    if model_options.get("custom_operations") is memory.LosslessOps:
+        keep_weights_compressed(model, os.path.basename(path))
     model.cached_patcher_init = (load_diffusion_model, (path, model_options))
     return model
 
@@ -77,8 +104,20 @@ def load_checkpoint(path, output_vae=True, output_clip=True, embedding_directory
     out = load_model(loader, path, "model.diffusion_model.", model_options, disable_dynamic)
     if out is None:
         raise RuntimeError(f"Could not detect the model type of {path}")
+    if model_options.get("custom_operations") is memory.LosslessOps:
+        keep_weights_compressed(out[0], os.path.basename(path))
     out[0].cached_patcher_init = (load_checkpoint, (path, False, False, embedding_directory, model_options), 0)
     return out
+
+
+def reload_keeping_compressed(init, disable_dynamic=False):
+    """Reload recipe for models from Keep Model Compressed: the original loader, then compression."""
+    loader, args, *index = init
+    model = loader(*args, disable_dynamic=True)
+    if index:
+        model = model[index[0]]
+    keep_weights_compressed(model, "Keep Model Compressed")
+    return model
 
 
 def load_text_encoder(paths, embedding_directory=None, clip_type=comfy.sd.CLIPType.STABLE_DIFFUSION, model_options={}, disable_dynamic=False):
@@ -120,9 +159,10 @@ class LoadDiffusionModelLossless(io.ComfyNode):
             inputs=[
                 io.Combo.Input("unet_name", options=compressed_files("diffusion_models")),
                 io.Boolean.Input("keep_compressed", default=False,
-                                 tooltip="Experimental. Keep the weights compressed in RAM and VRAM and decode each layer as it runs: "
-                                         "the model takes as much memory as the file, but every step is slower. Off: decode once "
-                                         "when loading, which only saves disk space."),
+                                 tooltip="Keep the weights compressed in RAM and VRAM and decode each layer as it runs: the "
+                                         "model takes about as much memory as the file (fp8 and int8 files too), with identical "
+                                         "results, but every step is slower (much less so with Triton installed). The console "
+                                         "reports the saving. Off: decode once when loading, which only saves disk space."),
             ],
             outputs=[io.Model.Output()],
         )
@@ -144,9 +184,10 @@ class LoadCheckpointLossless(io.ComfyNode):
             inputs=[
                 io.Combo.Input("ckpt_name", options=compressed_files("checkpoints")),
                 io.Boolean.Input("keep_compressed", default=False,
-                                 tooltip="Experimental. Keep the weights compressed in RAM and VRAM and decode each layer as it runs: "
-                                         "the model takes as much memory as the file, but every step is slower. Off: decode once "
-                                         "when loading, which only saves disk space."),
+                                 tooltip="Keep the weights compressed in RAM and VRAM and decode each layer as it runs: the "
+                                         "model takes about as much memory as the file (fp8 and int8 files too), with identical "
+                                         "results, but every step is slower (much less so with Triton installed). The console "
+                                         "reports the saving. Off: decode once when loading, which only saves disk space."),
             ],
             outputs=[io.Model.Output(), io.Clip.Output(), io.Vae.Output()],
         )
@@ -180,6 +221,41 @@ class LoadCLIPLossless(io.ComfyNode):
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         path = folder_paths.get_full_path_or_raise("text_encoders", clip_name)
         return io.NodeOutput(load_text_encoder([path], folder_paths.get_folder_paths("embeddings"), clip_type))
+
+
+class KeepModelCompressed(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="LosslessKeepModelCompressed",
+            display_name="Keep Model Compressed (Lossless VRAM)",
+            category=CATEGORY,
+            search_aliases=["lossless vram", "compress vram", "low vram", "keep compressed"],
+            description="Keeps the model's weights losslessly compressed in RAM and VRAM and decodes each layer when it "
+                        "runs. Results are exactly the same; the weights take less memory (about 31% less for bf16, "
+                        "22-26% for fp8, 16% for fp32, 13% for fp16 and for ComfyUI's fp8 \"scaled\" files, 9-23% for "
+                        "int8 convrot) but every step is slower. Install Triton to decode with a single GPU kernel. Works "
+                        "after any core loader, on regular model files too, with fp8 and int8 models; 4-bit layers are "
+                        "left as they are. Put it after the loader and LoRAs, and after Compress Model if you use it.",
+            inputs=[io.Model.Input("model")],
+            outputs=[io.Model.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model) -> io.NodeOutput:
+        if any(memory.is_compressed(p) for p in model.model.diffusion_model.parameters()):
+            return io.NodeOutput(model)
+        if model.cached_patcher_init is None:
+            raise ValueError("Keep Model Compressed needs its own copy of the model, but this model's loader doesn't "
+                             "record how it was loaded. It works with Load Diffusion Model, Load Checkpoint and this pack's loaders.")
+        # A private copy on the classic memory manager, with this model's LoRAs, patches and options.
+        kept = model.clone(disable_dynamic=True, force_deepcopy=True)
+        kept.hook_backup = {}
+        kept.parent = None
+        kept.clone_base_uuid = uuid.uuid4()  # its weights are no longer the input model's
+        keep_weights_compressed(kept, "Keep Model Compressed")
+        kept.cached_patcher_init = (reload_keeping_compressed, (model.cached_patcher_init,))
+        return io.NodeOutput(kept)
 
 
 class LoadLoraLossless(io.ComfyNode):
@@ -267,4 +343,5 @@ class CompressModelFile(io.ComfyNode):
         return io.NodeOutput(ui=ui.PreviewText(text))
 
 
-NODES = [CompressModelFile, LoadDiffusionModelLossless, LoadCheckpointLossless, LoadCLIPLossless, LoadLoraLossless, LoadVAELossless]
+NODES = [CompressModelFile, LoadDiffusionModelLossless, LoadCheckpointLossless, LoadCLIPLossless, LoadLoraLossless,
+         LoadVAELossless, KeepModelCompressed]
